@@ -36,7 +36,7 @@ locals {
 # ============================================================
 
 resource "aws_s3_bucket" "raw" {
-  bucket = "${local.bucket_prefix}-raw"
+  bucket = "${local.bucket_prefix}-raw-01"
   tags   = { Name = "${var.project_name}-raw", layer = "raw" }
 }
 
@@ -92,7 +92,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "raw" {
 # ============================================================
 
 resource "aws_s3_bucket" "bronze" {
-  bucket = "${local.bucket_prefix}-bronze"
+  bucket = "${local.bucket_prefix}-bronze-01"
   tags   = { Name = "${var.project_name}-bronze", layer = "bronze" }
 }
 
@@ -127,7 +127,7 @@ resource "aws_s3_bucket_public_access_block" "bronze" {
 # ============================================================
 
 resource "aws_s3_bucket" "silver" {
-  bucket = "${local.bucket_prefix}-silver"
+  bucket = "${local.bucket_prefix}-silver-01"
   tags   = { Name = "${var.project_name}-silver", layer = "silver" }
 }
 
@@ -163,7 +163,7 @@ resource "aws_s3_bucket_public_access_block" "silver" {
 # ============================================================
 
 resource "aws_s3_bucket" "gold" {
-  bucket = "${local.bucket_prefix}-gold"
+  bucket = "${local.bucket_prefix}-gold-01"
   tags   = { Name = "${var.project_name}-gold", layer = "gold" }
 }
 
