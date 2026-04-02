@@ -8,3 +8,4 @@ ingetion-user_cli-accessKeys.csv
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/terraform.tfvars
+*.docx
