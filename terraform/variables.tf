@@ -8,13 +8,13 @@
 variable "aws_region" {
   description = "AWS region for all resources"
   type        = string
-  default     = "eu-west-2" # London — change to your nearest region
+  default     = "eu-north-1" # London — change to your nearest region
 }
 
 variable "project_name" {
   description = "Project tag applied to every resource — used for cost tracking"
   type        = string
-  default     = "staff-de-journey"
+  default     = "ecommerce-lakehouse"
 }
 
 variable "env" {
