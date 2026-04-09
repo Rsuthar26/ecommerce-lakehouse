@@ -15,33 +15,17 @@ Every component is real infrastructure on real cloud services. Nothing is simula
 ## Architecture
 
 ![Architecture](architecture.png)
-```
-18 Data Sources
-      │
-      ├── Batch / Files / APIs     → Airflow (MWAA)
-      ├── Real-time streams        → AWS MSK (Kafka)
-      ├── CDC (Postgres changes)   → Debezium → MSK
-      ├── Event-driven             → AWS Lambda + SQS
-      └── Log streaming            → CloudWatch → Kinesis
-      │
-      ▼
-S3 Raw Landing Zone          ← immutable, partitioned by source + date
-      │
-      ▼
-Databricks (Delta Live Tables + PySpark)
-  Bronze  ← raw ingestion, schema applied, nothing dropped
-  Silver  ← cleaned, deduplicated, quarantine for bad records
-  Gold    ← aggregated, joined, business-ready
-      │
-      ▼
-Unity Catalog                ← governance, lineage, column-level security
-      │
-      ▼
-Databricks SQL Warehouse
-      │
-      ▼
-dbt Core → Tableau / Power BI
-```
+
+| Layer | Tool | Role |
+|---|---|---|
+| Sources | PostgreSQL, MongoDB, Kafka, IoT, APIs, Files, SaaS | 18 data origins |
+| Ingestion | Airflow MWAA, Kafka MSK, Debezium, Lambda, Kinesis | Batch + real-time |
+| Storage | AWS S3 Raw Landing Zone | Immutable, partitioned by source + date |
+| Processing | Databricks + Delta Live Tables + PySpark | Bronze → Silver → Gold |
+| Governance | Unity Catalog | Lineage, access, column-level security |
+| Serving | Databricks SQL Warehouse | BI query engine |
+| Analytics | dbt Core | Data marts, Gold transformations |
+| BI | Tableau + Power BI | Dashboards, self-serve analytics |
 
 ---
 
@@ -121,6 +105,7 @@ Every data source produces intentionally imperfect data — malformed records, m
 ---
 
 ## Repo Structure
+
 ```
 ecommerce-lakehouse/
 ├── generators/          18 data source simulators
@@ -135,7 +120,8 @@ ecommerce-lakehouse/
 ---
 
 ## Running a Demo
-```
+
+```bash
 # Provision infrastructure (~25 minutes first time)
 cd infrastructure/terraform
 terraform init
@@ -158,7 +144,7 @@ Total cost per demo session: approximately $2–3.
 |---|---|
 | All 18 data generators | ✅ Complete |
 | AWS infrastructure (Terraform) | ✅ Complete — RDS, MSK, EC2, S3 |
-| S3 Raw Landing Zone | 🔄 In progress |
+| S3 Raw Landing Zone | ✅ Complete — eu-north-1 |
 | Bronze ingestion pipelines | 🔄 In progress |
 | Silver cleaning layer | ⬜ Pending |
 | Gold analytics layer | ⬜ Pending |
