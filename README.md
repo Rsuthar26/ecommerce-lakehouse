@@ -13,6 +13,8 @@ Every component is real infrastructure on real cloud services. Nothing is simula
 ---
 
 ## Architecture
+
+![Architecture](architecture.png)
 ```
 18 Data Sources
       │
