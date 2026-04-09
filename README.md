@@ -54,30 +54,9 @@ Every component is real infrastructure on real cloud services. Nothing is simula
 
 ## Data Sources
 
-18 sources covering every ingestion pattern that exists in production systems:
+18 sources covering every ingestion pattern that exists in production systems — relational databases, NoSQL, REST APIs, GraphQL, real-time Kafka streams, CDC, IoT sensors, file drops, web scraping, message queues, and SaaS exports.
 
-| # | Source | Type |
-|---|--------|------|
-| 01 | RDS PostgreSQL | Relational database |
-| 02 | Debezium CDC | Change data capture |
-| 03 | MongoDB Atlas | NoSQL documents |
-| 04 | MSK Kafka Clickstream | Real-time event stream |
-| 05 | AWS SQS | Message queue |
-| 06 | Stripe API | REST API |
-| 07 | ShipStation API | REST API |
-| 08 | Shopify GraphQL | GraphQL API |
-| 09 | SFTP Drop | File transfer (CSV / Excel) |
-| 10 | Partner S3 Drop | File transfer (Parquet / Avro) |
-| 11 | ERP Export | Semi-structured (JSON / XML) |
-| 12 | Reviews and Tickets | Unstructured text |
-| 13 | S3 + Lambda | Event-driven binary metadata |
-| 14 | Scrapy | Web scraping |
-| 15 | MQTT IoT Sensors | Real-time IoT stream |
-| 16 | CloudWatch Logs | Application log stream |
-| 17 | GA4 Export | SaaS analytics export |
-| 18 | AWS SES Email | Email event stream |
-
-→ See [`generators/README.md`](generators/README.md) for the full breakdown of each source.
+→ Full breakdown of every source, what it simulates, and how it connects to Bronze: [`generators/README.md`](generators/README.md)
 
 ---
 
