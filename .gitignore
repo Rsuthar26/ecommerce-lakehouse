@@ -10,3 +10,6 @@ terraform/terraform.tfstate.backup
 terraform/terraform.tfvars
 *.docx
 .env
+terraform/*.backup
+terraform/.idea/
+generators/.DS_Store
