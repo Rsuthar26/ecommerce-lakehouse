@@ -214,7 +214,7 @@ resource "aws_db_instance" "postgres" {
   
   # Storage
   allocated_storage     = var.db_allocated_storage
-  max_allocated_storage = 100 # Autoscaling ceiling — prevents runaway storage cost
+  max_allocated_storage = 20 # Autoscaling ceiling — prevents runaway storage cost
   storage_type          = "gp2"
   storage_encrypted     = true # Always encrypt — costs nothing, good habit
 
