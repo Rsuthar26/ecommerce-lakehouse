@@ -4,427 +4,189 @@ generators/12_reviews_tickets/generate.py — Staff DE Journey: Source 12
 Simulates customer reviews and support tickets — unstructured text data.
 This feeds NLP/sentiment analysis in the Gold layer.
 
-Why unstructured text is the hardest source:
-  - No schema to validate against
-  - Free text can contain anything — HTML, emojis, SQL injection attempts
-  - Encoding issues (UTF-8 vs Latin-1 vs Windows-1252)
-  - PII everywhere (names, emails, addresses in ticket body)
-  - Length varies from 1 word to 10,000 words
-  - Silver layer must: detect language, extract sentiment, mask PII,
-    classify intent, route to correct team
-
-Real ingestion pattern:
-  1. Reviews API (Trustpilot/Google) → webhook → Lambda → S3
-  2. Support tickets (Zendesk/Freshdesk) → API poll → Airflow → S3
-  3. Both land as JSON files in raw/text/YYYY/MM/DD/
-  4. Databricks reads → Bronze table → NLP pipeline
-
-Rules satisfied:
-    Rule 1  — --mode burst and --mode stream
-    Rule 2  — burst < 2 minutes
-    Rule 3  — timestamps backdated realistically
-    Rule 4  — ticket status reflects age
-    Rule 5  — idempotent (record_id is stable)
-    Rule 6  — stream ~0.012 ops/sec (~1K records/day)
-    Rule 7  — dirty data, encoding issues, PII
-    Rule 8  — README.md exists
-    Rule 9  — connection via environment variables
-    Rule 10 — callable from single bash line
-
-Usage:
-    python generate.py --mode burst --output-dir /tmp/text_raw
-    python generate.py --mode burst --dirty --output-dir /tmp/text_raw
-    python generate.py --mode stream --output-dir /tmp/text_raw
+Rules: All 11 satisfied.
 """
 
-import os
-import json
-import time
-import random
-import logging
-import argparse
-import uuid
+import os, sys, json, time, random, logging, argparse, hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
 from faker import Faker
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from generators.shared.postgres_ids import load_entity_ids
+
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+fake = Faker("en_GB"); Faker.seed(42)
 
-fake = Faker("en_GB")
-Faker.seed(42)
+STREAM_SLEEP = 86400 / 1000
 
-STREAM_SLEEP = 1.0 / (1000 / 86400)  # ~1K records/day
-
-PRODUCT_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
-
-# ─────────────────────────────────────────────────────────────
-# REALISTIC REVIEW TEXT
-# Positive, negative, neutral — weighted realistically
-# Real product reviews cluster around 4-5 stars (J-curve distribution)
-# ─────────────────────────────────────────────────────────────
-
-POSITIVE_REVIEWS = [
-    "Absolutely love this product! Arrived quickly and works perfectly.",
-    "Great quality for the price. Would definitely recommend to anyone.",
-    "Exceeded my expectations. The build quality is excellent.",
-    "Fast delivery, well packaged, and exactly as described. 5 stars!",
-    "Been using this for a month now and still going strong. Very happy.",
-    "Perfect gift. Recipient was thrilled. Will buy again.",
-    "Solid product. Does exactly what it says on the tin.",
-    "Brilliant! Noticed an immediate improvement. Very impressed.",
-    "Superb quality. Customer service was also very helpful.",
-    "Fantastic product at a great price. Highly recommended!",
+REVIEW_POSITIVE = [
+    "Absolutely love this product. Arrived quickly and exactly as described.",
+    "Great quality, very happy with my purchase. Would definitely recommend.",
+    "Exceeded my expectations. Packaging was excellent and delivery was fast.",
+    "Perfect for what I needed. Great value for money.",
+    "Really impressed with the quality. My second purchase from this store.",
+]
+REVIEW_NEGATIVE = [
+    "Disappointed with the quality. Not as described on the website.",
+    "Arrived damaged and took forever to resolve the issue with customer service.",
+    "Product stopped working after 2 weeks. Very poor quality for the price.",
+    "Packaging was terrible. Item arrived scratched.",
+    "Complete waste of money. Nothing like the pictures.",
+]
+REVIEW_NEUTRAL = [
+    "Decent product for the price. Does what it says.",
+    "OK, nothing special. Delivery was on time.",
+    "Average quality but arrived quickly.",
+    "Fine, but the instructions were confusing.",
 ]
 
-NEGATIVE_REVIEWS = [
-    "Stopped working after 2 weeks. Very disappointing.",
-    "Arrived damaged. Packaging was poor and product was broken.",
-    "Not as described. Completely different from the photos.",
-    "Terrible quality. Fell apart immediately. Do not buy.",
-    "Waited 3 weeks for delivery and it arrived wrong. Awful experience.",
-    "Overpriced for what you get. Much better alternatives available.",
-    "Customer service completely ignored my complaint. Shocking.",
-    "Product is a cheap imitation. Nothing like the description.",
-    "Broke on first use. Complete waste of money.",
-    "Very disappointed. Expected much better for the price.",
+TICKET_TEMPLATES = [
+    "My order #{order_id} has not arrived yet. It's been {days} days.",
+    "I received the wrong item in order #{order_id}. I ordered {sku} but received something else.",
+    "I need to return my order #{order_id}. The product is defective.",
+    "When will order #{order_id} be dispatched? The tracking hasn't updated.",
+    "I was charged twice for order #{order_id}. Please refund one payment.",
+    "The product in order #{order_id} is not working. I need a replacement.",
+    "I'd like to change the delivery address for order #{order_id}.",
+    "Can I get a VAT invoice for order #{order_id}?",
 ]
 
-NEUTRAL_REVIEWS = [
-    "Decent product. Does the job but nothing special.",
-    "Average quality. Delivery was fine. Nothing to complain about.",
-    "It's OK. Not as good as expected but acceptable for the price.",
-    "Works as expected. Nothing more, nothing less.",
-    "Reasonable product. Arrived on time. Average overall.",
-]
+TICKET_CATEGORIES = ["delivery","returns","billing","product","account","other"]
+TICKET_STATUSES   = ["open","pending","resolved","closed"]
 
-SUPPORT_SUBJECTS = [
-    "Order not arrived after 2 weeks",
-    "Wrong item received",
-    "Item arrived damaged",
-    "Request for refund",
-    "Where is my order?",
-    "Product stopped working",
-    "Incorrect charge on my account",
-    "Need to change delivery address",
-    "Return request",
-    "Product not as described",
-    "Missing parts from order",
-    "Delivery to wrong address",
-    "Duplicate charge",
-    "Warranty claim",
-    "Exchange request",
-]
+# Rule 3 — reviews and tickets submitted during waking hours 9am-11pm, peak evening
+def customer_hours_timestamp(base_dt: datetime) -> datetime:
+    peak_windows = [(19,22,0.30),(9,12,0.25),(12,19,0.30),(22,23,0.10),(8,9,0.05)]
+    r, cumul, s, e = random.random(), 0.0, 19, 22
+    for start, end, w in peak_windows:
+        cumul += w
+        if r <= cumul:
+            s, e = start, end
+            break
+    return base_dt.replace(hour=random.randint(s, e-1), minute=random.randint(0,59),
+                           second=random.randint(0,59), tzinfo=timezone.utc)
 
-SUPPORT_BODIES = [
-    "Hi, I placed an order {days} days ago (order #{order_id}) and it still hasn't arrived. "
-    "Can you please look into this? My tracking number shows no updates.",
+_entity_ids = None
+def get_entity_ids():
+    global _entity_ids
+    if _entity_ids is None: _entity_ids = load_entity_ids()
+    return _entity_ids
 
-    "I received my order today but it's completely wrong. "
-    "I ordered {product} but received something completely different. "
-    "Please advise how to return and get the correct item.",
-
-    "My package arrived this morning but the item was damaged. "
-    "The box was crushed and the product inside is broken. "
-    "I have photos if needed. I'd like a replacement please.",
-
-    "I'd like to request a refund for order #{order_id}. "
-    "The product is not what I expected and I'd like to return it. "
-    "Please let me know the returns process.",
-
-    "Hello, I'm contacting you because I was charged twice for my order #{order_id}. "
-    "Please can you refund the duplicate charge as soon as possible.",
-]
-
-TICKET_STATUSES = {
-    "new":          {"age_hours": (0, 2)},
-    "open":         {"age_hours": (2, 24)},
-    "pending":      {"age_hours": (24, 72)},
-    "resolved":     {"age_hours": (72, 720)},
-    "closed":       {"age_hours": (720, 9999)},
-}
-
-TICKET_PRIORITIES = ["low", "normal", "high", "urgent"]
-
-
-# ─────────────────────────────────────────────────────────────
-# RULE 3 + 4 — TIMESTAMPS AND STATUS
-# ─────────────────────────────────────────────────────────────
-
-def backdate(days_ago: float) -> datetime:
-    return datetime.now(timezone.utc) - timedelta(days=days_ago)
+def dr(base, dirty, elevated): return elevated if dirty else base
+def maybe_null(v, dirty, base=0.05, elev=0.20):
+    return None if random.random() < dr(base, dirty, elev) else v
 
 def ticket_status_for_age(created_at: datetime) -> str:
     age_hrs = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
-    if age_hrs < 2:
-        return "new"
-    elif age_hrs < 24:
-        return "open"
-    elif age_hrs < 72:
-        return "pending"
-    elif age_hrs < 720:
-        return "resolved"
-    else:
-        return "closed"
-
-
-# ─────────────────────────────────────────────────────────────
-# RULE 7 — DIRTY DATA
-# ─────────────────────────────────────────────────────────────
-
-def dr(base, dirty, elevated):
-    return elevated if dirty else base
-
-def maybe_inject_html(text, dirty):
-    """Some users paste HTML into review forms."""
-    if dirty and random.random() < 0.05:
-        return f"<b>{text}</b> <script>alert('xss')</script>"
-    return text
-
-def maybe_encoding_issue(text, dirty):
-    """Simulate Windows-1252 characters in UTF-8 stream."""
-    if dirty and random.random() < 0.03:
-        return text + " \x92\x93\x94"  # Windows smart quotes
-    return text
-
-def maybe_null(value, dirty, base=0.05, elev=0.20):
-    if random.random() < dr(base, dirty, elev):
-        return None
-    return value
-
-def maybe_future_ts(ts, dirty):
-    if dirty and random.random() < 0.02:
-        return datetime(2099, 1, 1, tzinfo=timezone.utc).isoformat()
-    return ts.isoformat()
-
-
-# ─────────────────────────────────────────────────────────────
-# RECORD BUILDERS
-# ─────────────────────────────────────────────────────────────
+    if age_hrs < 2:   return "open"
+    elif age_hrs < 24: return random.choices(["open","pending"], weights=[0.4,0.6])[0]
+    elif age_hrs < 72: return random.choices(["pending","resolved"], weights=[0.4,0.6])[0]
+    else:              return random.choices(["resolved","closed"], weights=[0.5,0.5])[0]
 
 def build_review(created_at: datetime, dirty: bool = False) -> dict:
-    """Build a product review record."""
-    # J-curve distribution — most reviews are 4-5 stars
-    rating = random.choices([1, 2, 3, 4, 5], weights=[5, 5, 10, 30, 50])[0]
+    ids      = get_entity_ids()
+    order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else None
+    sku      = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+    rating   = random.choices([1,2,3,4,5], weights=[0.05,0.08,0.12,0.30,0.45])[0]
 
-    if rating >= 4:
-        text = random.choice(POSITIVE_REVIEWS)
-    elif rating <= 2:
-        text = random.choice(NEGATIVE_REVIEWS)
-    else:
-        text = random.choice(NEUTRAL_REVIEWS)
+    if rating >= 4:   body = random.choice(REVIEW_POSITIVE)
+    elif rating <= 2: body = random.choice(REVIEW_NEGATIVE)
+    else:             body = random.choice(REVIEW_NEUTRAL)
 
-    text = maybe_inject_html(text, dirty)
-    text = maybe_encoding_issue(text, dirty)
+    # Dirty: inject garbled text
+    if dirty and random.random() < 0.02:
+        body = body[:random.randint(5,20)] + "..." + ("?" * random.randint(0,5))
 
     return {
-        "record_id":     str(uuid.uuid4()),
         "record_type":   "review",
-        "source":        random.choice(["website", "trustpilot", "google", "app"]),
-        "product_sku":   maybe_null(random.choice(PRODUCT_SKUS), dirty),
-        "order_id":      maybe_null(random.randint(1, 6751), dirty),
-        "rating":        rating,
+        "review_id":     hashlib.md5(f"review_{order_id}_{created_at.isoformat()}".encode()).hexdigest()[:16],
+        "order_id":      maybe_null(order_id, dirty, base=0.01),
+        "product_sku":   maybe_null(sku, dirty, base=0.01),
+        "customer_id":   maybe_null(random.choice(ids["customer_ids"]) if ids["customer_ids"] else None, dirty),
+        "rating":        maybe_null(rating, dirty),
         "title":         maybe_null(fake.sentence(nb_words=5), dirty),
-        "body":          text,
-        "author_name":   maybe_null(fake.name(), dirty),
-        "author_email":  maybe_null(fake.email(), dirty),
-        "verified_purchase": random.random() > 0.2,
-        "helpful_votes": random.randint(0, 50),
-        "language":      "en",
-        "created_at":    maybe_future_ts(created_at, dirty),
-        "updated_at":    created_at.isoformat(),
-        "status":        random.choice(["published", "pending_moderation", "rejected"]),
+        "body":          maybe_null(body, dirty),
+        "verified_purchase": random.random() > 0.1,
+        "helpful_votes": maybe_null(random.randint(0,50), dirty),
+        "created_at":    created_at.isoformat(),
+        "_source":       "reviews",
     }
-
 
 def build_ticket(created_at: datetime, dirty: bool = False) -> dict:
-    """Build a support ticket record."""
-    order_id  = random.randint(1, 6751)
-    product   = random.choice(["Wireless Headphones", "USB-C Hub", "Laptop Stand"])
-    days_ago  = (datetime.now(timezone.utc) - created_at).days
-
-    subject   = random.choice(SUPPORT_SUBJECTS)
-    body_tmpl = random.choice(SUPPORT_BODIES)
-    body      = body_tmpl.format(
-        days=days_ago or 1,
-        order_id=order_id,
-        product=product
-    )
-
-    body = maybe_inject_html(body, dirty)
-    body = maybe_encoding_issue(body, dirty)
-
-    status   = ticket_status_for_age(created_at)
-    priority = random.choices(
-        TICKET_PRIORITIES,
-        weights=[30, 50, 15, 5]
-    )[0]
-
-    resolved_at = None
-    if status in ("resolved", "closed"):
-        resolved_at = (created_at + timedelta(
-            hours=random.uniform(4, 72))).isoformat()
+    ids      = get_entity_ids()
+    order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else 12345
+    sku      = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+    template = random.choice(TICKET_TEMPLATES)
+    body     = template.format(order_id=order_id, days=random.randint(3,14), sku=sku)
 
     return {
-        "record_id":      str(uuid.uuid4()),
-        "record_type":    "support_ticket",
-        "ticket_id":      f"TKT-{random.randint(100000, 999999)}",
-        "source":         random.choice(["email", "web_form", "chat", "phone"]),
-        "order_id":       maybe_null(order_id, dirty),
-        "product_sku":    maybe_null(random.choice(PRODUCT_SKUS), dirty),
-        "subject":        maybe_null(subject, dirty),
-        "body":           body,
-        "author_name":    maybe_null(fake.name(), dirty),
-        "author_email":   maybe_null(fake.email(), dirty),
-        "status":         status,
-        "priority":       priority,
-        "assigned_to":    maybe_null(fake.user_name(), dirty),
-        "tags":           random.sample(
-                              ["refund", "shipping", "damaged", "wrong_item",
-                               "billing", "technical", "general"],
-                              random.randint(0, 3)),
-        "satisfaction_score": maybe_null(
-            random.choice([1, 2, 3, 4, 5]), dirty,
-            base=0.30, elev=0.50  # Often missing — customer doesn't rate
-        ),
-        "created_at":     maybe_future_ts(created_at, dirty),
-        "updated_at":     created_at.isoformat(),
-        "resolved_at":    resolved_at,
-        "first_response_hours": maybe_null(
-            round(random.uniform(0.5, 48), 1), dirty),
+        "record_type":  "ticket",
+        "ticket_id":    f"TKT-{hashlib.md5(f'ticket_{order_id}_{created_at.isoformat()}'.encode()).hexdigest()[:8].upper()}",
+        "order_id":     maybe_null(order_id, dirty, base=0.02),
+        "customer_id":  maybe_null(random.choice(ids["customer_ids"]) if ids["customer_ids"] else None, dirty),
+        "category":     maybe_null(random.choice(TICKET_CATEGORIES), dirty),
+        "status":       ticket_status_for_age(created_at),
+        "priority":     maybe_null(random.choice(["low","medium","high","urgent"]), dirty),
+        "subject":      maybe_null(f"Issue with order #{order_id}", dirty),
+        "body":         maybe_null(body, dirty),
+        "channel":      maybe_null(random.choice(["email","chat","phone","web"]), dirty),
+        "agent_id":     maybe_null(f"AGENT-{random.randint(1,20)}", dirty),
+        "resolved_at":  (created_at + timedelta(hours=random.randint(1,72))).isoformat()
+                        if ticket_status_for_age(created_at) in ("resolved","closed") else None,
+        "created_at":   created_at.isoformat(),
+        "_source":      "support_tickets",
+        # Dirty: 2% future timestamps
+        **( {"created_at": "2099-01-01T00:00:00+00:00"} if dirty and random.random() < 0.02 else {} ),
     }
 
+def write_batch(records, output_dir, batch_num, ts):
+    dp = output_dir / ts.strftime("%Y/%m/%d"); dp.mkdir(parents=True, exist_ok=True)
+    with open(dp / f"text_records_{batch_num:04d}.json","w") as f:
+        json.dump({"batch": batch_num, "count": len(records), "records": records}, f, default=str)
 
-# ─────────────────────────────────────────────────────────────
-# OUTPUT
-# ─────────────────────────────────────────────────────────────
-
-def write_batch(records: list, output_dir: Path,
-                batch_num: int, ts: datetime) -> None:
-    date_path = output_dir / ts.strftime("%Y/%m/%d/%H")
-    date_path.mkdir(parents=True, exist_ok=True)
-    file_path = date_path / f"text_batch_{batch_num:04d}.json"
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "batch":      batch_num,
-            "count":      len(records),
-            "fetched_at": ts.isoformat(),
-            "records":    records,
-        }, f, default=str, ensure_ascii=False)  # ensure_ascii=False preserves emojis
-
-
-# ─────────────────────────────────────────────────────────────
-# BURST MODE
-# ─────────────────────────────────────────────────────────────
-
-def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
-    log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    t0    = time.time()
-    stats = {"reviews": 0, "tickets": 0, "batches": 0}
-
-    # ~1K records/day = ~7K records over 7 days
-    total_records = days * 1000
-    batch_size    = 100
-    batch_num     = 0
-    buffer        = []
-
-    for i in range(total_records):
+def run_burst(output_dir, days=7, dirty=False):
+    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
+    t0, stats, now = time.time(), {"records":0,"batches":0}, datetime.now(timezone.utc)
+    total, batch_size, buf, bn = days * 150, 50, [], 0
+    for _ in range(total):
         days_ago   = random.uniform(0, days)
-        created_at = backdate(days_ago)
-
-        # 60% reviews, 40% tickets
-        if random.random() < 0.6:
-            record = build_review(created_at, dirty)
-            stats["reviews"] += 1
-        else:
-            record = build_ticket(created_at, dirty)
-            stats["tickets"] += 1
-
-        buffer.append(record)
-
-        if len(buffer) >= batch_size:
-            write_batch(buffer, output_dir, batch_num,
-                        backdate(days_ago))
-            stats["batches"] += 1
-            batch_num += 1
-            buffer = []
-
-    if buffer:
-        write_batch(buffer, output_dir, batch_num,
-                    datetime.now(timezone.utc))
-        stats["batches"] += 1
-
+        base_dt    = now - timedelta(days=days_ago)
+        created_at = customer_hours_timestamp(base_dt)
+        record     = build_review(created_at, dirty) if random.random() > 0.4 else build_ticket(created_at, dirty)
+        buf.append(record); stats["records"] += 1
+        if len(buf) >= batch_size:
+            write_batch(buf, output_dir, bn, created_at); bn += 1; buf = []
+    if buf: write_batch(buf, output_dir, bn, datetime.now(timezone.utc)); stats["batches"] = bn+1
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
-    if elapsed > 120:
-        log.warning(f"Rule 2 VIOLATION: {elapsed:.0f}s > 120s")
-    else:
-        log.info(f"Rule 2 ✅ {elapsed:.1f}s < 120s")
+    log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
-
-# ─────────────────────────────────────────────────────────────
-# STREAM MODE
-# ─────────────────────────────────────────────────────────────
-
-def run_stream(output_dir: Path, dirty: bool = False):
-    log.info(f"STREAM MODE | ~1K records/day | dirty={dirty} | Ctrl+C to stop")
-
-    stats, i = {"records": 0}, 0
-
+def run_stream(output_dir, dirty=False):
+    log.info(f"STREAM MODE | ~1K/day | dirty={dirty} | Ctrl+C to stop")
+    get_entity_ids(); stats, i = {"records":0}, 0
     try:
         while True:
-            i  += 1
-            now = datetime.now(timezone.utc)
-
-            if random.random() < 0.6:
-                record = build_review(now, dirty)
-            else:
-                record = build_ticket(now, dirty)
-
+            i += 1; now = datetime.now(timezone.utc)
+            record = build_review(now, dirty) if random.random() > 0.4 else build_ticket(now, dirty)
             write_batch([record], output_dir, i, now)
             stats["records"] += 1
-
-            if i % 100 == 0:
-                log.info(f"Stream — {stats}")
-
+            if i % 50 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
-
-    except KeyboardInterrupt:
-        log.info(f"Stopped. {stats}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────
+    except KeyboardInterrupt: log.info(f"Stopped. {stats}")
 
 def main():
-    p = argparse.ArgumentParser(description="Source 12 — Reviews/Tickets generator")
-    p.add_argument("--mode",       choices=["burst", "stream"], required=True)
-    p.add_argument("--days",       type=int, default=7)
-    p.add_argument("--dirty",      action="store_true")
-    p.add_argument("--output-dir", type=str,
-                   default=os.environ.get("TEXT_OUTPUT_DIR", "/tmp/text_raw"))
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["burst","stream"], required=True)
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--dirty", action="store_true")
+    p.add_argument("--output-dir", type=str, default=os.environ.get("REVIEWS_OUTPUT_DIR","/tmp/text_raw"))
     args = p.parse_args()
+    od = Path(args.output_dir); od.mkdir(parents=True, exist_ok=True)
+    if args.mode == "burst": run_burst(od, args.days, args.dirty)
+    else: run_stream(od, args.dirty)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"Source 12 | mode={args.mode} | days={args.days} | "
-             f"dirty={args.dirty} | output={output_dir}")
-
-    if args.mode == "burst":
-        run_burst(output_dir, args.days, args.dirty)
-    elif args.mode == "stream":
-        run_stream(output_dir, args.dirty)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

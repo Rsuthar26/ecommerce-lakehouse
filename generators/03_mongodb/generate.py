@@ -1,465 +1,336 @@
 """
-generators/06_stripe/generate.py — Staff DE Journey: Source 06
+generators/03_mongodb/generate.py — Staff DE Journey: Source 03
 
-Simulates Stripe API responses for payments, charges, refunds, disputes.
-Reads real order/payment data from Postgres to ensure joinability.
-Outputs JSON files to S3 (or local path for dev) — Bronze layer.
+Simulates the product catalog stored in MongoDB Atlas.
+200 products with nested variants, category-specific attributes, price history.
 
-Real Stripe ingestion pattern:
-  1. Airflow triggers this job on a schedule (hourly)
-  2. Job calls stripe.PaymentIntent.list(created_after=last_run_ts)
-  3. Paginate through results
-  4. Write each page as a JSON file to S3: raw/stripe/YYYY/MM/DD/HH/page_N.json
-  5. Databricks Autoloader picks up new files → Bronze table
+product_sku matches what order_items in Postgres references.
+This is the cross-system foreign key — Postgres holds the order reference,
+MongoDB holds the product detail.
 
 Rules satisfied:
     Rule 1  — --mode burst and --mode stream
-    Rule 2  — burst produces 7 days, < 2 minutes
-    Rule 3  — timestamps backdated realistically
-    Rule 4  — payment status reflects age
-    Rule 5  — idempotent (payment_intent_id is stable)
-    Rule 6  — stream ~0.12 ops/sec (~10K records/day)
-    Rule 7  — dirty data + quarantine file
+    Rule 2  — burst < 2 minutes (200 products = fast)
+    Rule 3  — product created_at spread across burst period
+    Rule 4  — product status reflects age and inventory level
+    Rule 5  — upsert by _id (idempotent — safe to run twice)
+    Rule 6  — stream: ~1 product update per 9s (~10K/day)
+    Rule 7  — dirty: missing fields, wrong types, truncated descriptions
     Rule 8  — README.md exists
-    Rule 9  — connection via environment variables
+    Rule 9  — env vars: MONGO_URI
     Rule 10 — callable from single bash line
+    Rule 11 — product_sku matches Postgres order_items (same SKU-XXXXX format)
 
 Usage:
-    python generate.py --mode burst --output-dir /tmp/stripe_output
-    python generate.py --mode burst --dirty --output-dir /tmp/stripe_output
-    python generate.py --mode stream --output-dir /tmp/stripe_output
+    python generate.py --mode burst --days 7
+    python generate.py --mode burst --days 7 --dirty
+    python generate.py --mode stream
 """
 
 import os
 import sys
-import json
 import time
 import random
 import logging
 import argparse
-import uuid
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
-import psycopg2
-import psycopg2.extras
 from faker import Faker
 from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
+
+try:
+    from pymongo import MongoClient, UpdateOne
+    from pymongo.errors import BulkWriteError
+except ImportError:
+    log.error("pymongo not installed: pip install pymongo")
+    sys.exit(1)
 
 fake = Faker("en_GB")
 Faker.seed(42)
 
-STREAM_SLEEP = 1.0 / (10000 / 86400)  # ~10K records/day
+STREAM_SLEEP = 86400 / 10000  # Rule 6 + Rule 13: ~10K updates/day
+MONGO_URI    = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+DB_NAME      = os.environ.get("MONGO_DBNAME", "ecommerce")
+COLLECTION   = "products"
+HISTORY_COL  = "product_price_history"
 
-CARD_BRANDS   = ["visa", "mastercard", "amex", "discover"]
-CARD_NETWORKS = ["visa", "mastercard", "amex"]
-CURRENCIES    = ["gbp"]
-FAILURE_CODES = [
-    "insufficient_funds", "card_declined", "expired_card",
-    "incorrect_cvc", "processing_error", "do_not_honor"
-]
+PRODUCT_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]  # Must match Postgres
+
+CATEGORIES = {
+    "Electronics": {
+        "subcategories": ["Audio", "Computing", "Cameras", "Wearables", "Smart Home"],
+        "brands": ["SoundMax", "TechPro", "AudioEdge", "PixelVision"],
+        "attributes": lambda: {
+            "connectivity": random.choice(["Bluetooth 5.0", "USB-C", "WiFi 6", "Wired"]),
+            "warranty_years": random.randint(1, 3),
+            "power_watts": random.randint(5, 150),
+        }
+    },
+    "Furniture": {
+        "subcategories": ["Desks", "Chairs", "Storage", "Shelving"],
+        "brands": ["WorkSpace Co", "ErgoLine", "ModernHome"],
+        "attributes": lambda: {
+            "material":  random.choice(["Oak", "Walnut", "MDF", "Steel", "Acrylic"]),
+            "assembly_required": random.random() > 0.3,
+            "weight_kg": round(random.uniform(2, 50), 1),
+            "max_load_kg": random.randint(20, 200),
+        }
+    },
+    "Accessories": {
+        "subcategories": ["Cables", "Cases", "Stands", "Organisers"],
+        "brands": ["AccessPro", "QuickFit", "SlimLine"],
+        "attributes": lambda: {
+            "compatibility": random.choice(["Universal", "Apple", "Samsung", "Multi-device"]),
+            "colour": random.choice(["Black", "White", "Silver", "Space Grey"]),
+        }
+    },
+}
+
 
 # ─────────────────────────────────────────────────────────────
-# RULE 4 — STATUS REFLECTS AGE
+# RULE 4 — PRODUCT STATUS REFLECTS AGE AND STOCK
 # ─────────────────────────────────────────────────────────────
 
-def stripe_status_for_age(created_at: datetime, order_status: str) -> str:
-    """Stripe payment status must be consistent with order age and status."""
-    age_hrs = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
-
-    if order_status in ("cancelled", "refunded"):
-        return random.choices(
-            ["canceled", "requires_payment_method"],
-            weights=[0.7, 0.3]
-        )[0]
-    elif age_hrs < 1:
-        return "requires_confirmation"
-    elif age_hrs < 3:
-        return "processing"
+def product_status(created_at: datetime, stock: int) -> str:
+    age_days = (datetime.now(timezone.utc) - created_at).days
+    if stock == 0:
+        return "out_of_stock"
+    elif stock < 10:
+        return "low_stock"
+    elif age_days < 14:
+        return "new"
+    elif age_days > 365 and random.random() < 0.05:
+        return "discontinued"
     else:
-        return random.choices(
-            ["succeeded", "succeeded", "succeeded", "requires_payment_method"],
-            weights=[0.92, 0.02, 0.03, 0.03]
-        )[0]
+        return "active"
 
 
 # ─────────────────────────────────────────────────────────────
 # RULE 7 — DIRTY DATA
 # ─────────────────────────────────────────────────────────────
 
-def dr(base, dirty, elevated):
-    return elevated if dirty else base
+def dr(base, dirty, elevated): return elevated if dirty else base
+def maybe_null(v, dirty, base=0.05, elev=0.20):
+    return None if random.random() < dr(base, dirty, elev) else v
 
-def bad_amount(amount, dirty):
+def dirty_price(price_pence, dirty):
     if random.random() < dr(0.005, dirty, 0.08):
-        return random.choice([0, -1, None, "free", 999999999])
-    return amount
+        return random.choice(["POA", None, -1, 0, "free"])
+    return price_pence
 
-def bad_currency(dirty):
+def dirty_sku(sku, dirty):
     if random.random() < dr(0.01, dirty, 0.10):
-        return random.choice(["GBP", "gbP", "usd", "EUR", None, ""])
-    return "gbp"
-
-def missing_field(value, dirty, base=0.05, elev=0.20):
-    return None if random.random() < dr(base, dirty, elev) else value
+        return random.choice(["", None, sku.lower(), "UNKNOWN"])
+    return sku
 
 
 # ─────────────────────────────────────────────────────────────
-# QUARANTINE — written to a separate JSON file
+# PRODUCT BUILDER
 # ─────────────────────────────────────────────────────────────
 
-def quarantine(output_dir: Path, reason: str, data: dict):
-    q_dir  = output_dir / "quarantine"
-    q_dir.mkdir(parents=True, exist_ok=True)
-    q_file = q_dir / f"quarantine_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json"
-    with open(q_file, "w") as f:
-        json.dump({"reason": reason, "data": data,
-                   "ts": datetime.now(timezone.utc).isoformat()}, f)
-    log.warning(f"QUARANTINE {reason[:80]}")
+def build_product(sku: str, created_at: datetime, dirty: bool = False) -> dict:
+    category_name = random.choice(list(CATEGORIES.keys()))
+    category      = CATEGORIES[category_name]
+    subcategory   = random.choice(category["subcategories"])
+    brand         = random.choice(category["brands"])
+    price_pence   = random.randint(499, 29999)
+    cost_pence    = int(price_pence * random.uniform(0.4, 0.65))
+    stock         = random.randint(0, 500)
 
+    # Variants — e.g. colour variants of the same product
+    variants = []
+    for colour in random.sample(["Black", "White", "Silver", "Blue", "Red"], k=random.randint(1, 3)):
+        v_price = int(price_pence * random.uniform(0.9, 1.1))
+        variants.append({
+            "colour":       colour,
+            "sku_variant":  f"{sku}-{colour[:3].upper()}",
+            "price_pence":  dirty_price(v_price, dirty),
+            "stock":        maybe_null(random.randint(0, 200), dirty),
+            "weight_grams": maybe_null(random.randint(100, 5000), dirty),
+        })
 
-# ─────────────────────────────────────────────────────────────
-# POSTGRES CONNECTION (Rule 9)
-# Read real order/payment data to ensure joinability
-# ─────────────────────────────────────────────────────────────
+    status = product_status(created_at, stock)
 
-def get_pg_connection():
-    return psycopg2.connect(
-        host=os.environ["DB_HOST"],
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ.get("DB_NAME", "ecommerce"),
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        connect_timeout=10,
-    )
-
-
-def fetch_payments_from_postgres(days: int = 7) -> list[dict]:
-    """
-    Fetch real payment records from Postgres.
-    These are the source of truth for order IDs and amounts.
-    Stripe records must reference the same IDs.
-    """
-    conn = get_pg_connection()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    p.payment_id,
-                    p.order_id,
-                    p.amount_pence,
-                    p.currency,
-                    p.payment_status,
-                    p.payment_method,
-                    p.card_last4,
-                    p.card_brand,
-                    p.created_at,
-                    o.order_status,
-                    o.placed_at
-                FROM payments p
-                JOIN orders o ON p.order_id = o.order_id
-                WHERE p.created_at >= NOW() - INTERVAL '%s days'
-                ORDER BY p.created_at DESC
-            """, (days,))
-            rows = cur.fetchall()
-            return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-# ─────────────────────────────────────────────────────────────
-# STRIPE RECORD BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_stripe_payment_intent(pg_payment: dict, dirty: bool = False) -> dict:
-    """
-    Build a realistic Stripe PaymentIntent object based on a Postgres payment record.
-    The payment_intent_id is derived from payment_id — stable and joinable.
-
-    In production: Stripe generates pi_XXXX IDs. We simulate this by
-    using a deterministic format based on our payment_id.
-    """
-    payment_id   = pg_payment["payment_id"]
-    order_id     = pg_payment["order_id"]
-    amount_pence = pg_payment["amount_pence"]
-    created_at   = pg_payment["created_at"]
-    order_status = pg_payment["order_status"]
-
-    # Deterministic payment intent ID — same payment always gets same Stripe ID
-    # This is critical for idempotency (Rule 5)
-    pi_id     = f"pi_{str(payment_id).zfill(8)}{str(order_id).zfill(8)}"
-    charge_id = f"ch_{str(payment_id).zfill(8)}{str(order_id).zfill(6)}"
-
-    stripe_status = stripe_status_for_age(created_at, order_status)
-    amount        = bad_amount(amount_pence, dirty)
-    currency      = bad_currency(dirty)
-
-    # Validate
-    if amount is None or not isinstance(amount, int) or amount <= 0:
-        return None  # caller quarantines
-
-    card_brand = pg_payment.get("card_brand") or random.choice(CARD_BRANDS)
-    card_last4 = pg_payment.get("card_last4") or str(random.randint(1000, 9999))
-
-    # Stripe charge object (nested inside payment intent)
-    charge = {
-        "id":                charge_id,
-        "object":            "charge",
-        "amount":            amount,
-        "amount_captured":   amount if stripe_status == "succeeded" else 0,
-        "amount_refunded":   0,
-        "currency":          currency,
-        "captured":          stripe_status == "succeeded",
-        "disputed":          random.random() < 0.002,  # 0.2% dispute rate
-        "paid":              stripe_status == "succeeded",
-        "refunded":          False,
-        "status":            "succeeded" if stripe_status == "succeeded" else "failed",
-        "failure_code":      random.choice(FAILURE_CODES) if stripe_status != "succeeded" else None,
-        "failure_message":   None,
-        "payment_method_details": {
-            "card": {
-                "brand":      card_brand,
-                "last4":      card_last4,
-                "exp_month":  missing_field(random.randint(1, 12), dirty),
-                "exp_year":   missing_field(random.randint(2025, 2030), dirty),
-                "country":    missing_field("GB", dirty),
-                "funding":    random.choice(["credit", "debit", "prepaid"]),
-                "network":    missing_field(card_brand, dirty),
-            },
-            "type": "card"
-        },
-        "billing_details": {
-            "name":    missing_field(fake.name(), dirty),
-            "email":   missing_field(fake.email(), dirty),
-            "address": {
-                "city":        missing_field(fake.city(), dirty),
-                "country":     missing_field("GB", dirty),
-                "postal_code": missing_field(fake.postcode(), dirty),
-                "line1":       missing_field(fake.street_address(), dirty),
-            }
-        },
-        "created": int(created_at.timestamp()),
+    product = {
+        "_id":              dirty_sku(sku, dirty),
+        "product_sku":      sku,  # Always clean — needed for joins
+        "name":             maybe_null(fake.catch_phrase(), dirty),
+        "category":         category_name,
+        "subcategory":      maybe_null(subcategory, dirty),
+        "brand":            maybe_null(brand, dirty),
+        "description":      maybe_null(
+            " ".join(fake.sentences(nb=random.randint(2, 4))), dirty),
+        "base_price_pence": dirty_price(price_pence, dirty),
+        "cost_price_pence": maybe_null(cost_pence, dirty),
+        "variants":         variants,
+        "attributes":       maybe_null(category["attributes"](), dirty),
+        "images":           [
+            f"https://cdn.ecommerce.example.com/products/{sku}/main.jpg",
+            f"https://cdn.ecommerce.example.com/products/{sku}/alt1.jpg",
+        ] if not dirty or random.random() > 0.05 else [],
+        "tags":             random.sample(
+            ["sale", "new", "bestseller", "clearance", "exclusive", "bundle"], k=2),
+        "status":           status,
+        "rating":           maybe_null(round(random.uniform(3.0, 5.0), 1), dirty),
+        "review_count":     maybe_null(random.randint(0, 500), dirty),
+        "created_at":       created_at.isoformat(),
+        "updated_at":       created_at.isoformat(),
     }
 
-    # Add refund if order is refunded
-    if order_status == "refunded":
-        charge["amount_refunded"] = amount
-        charge["refunded"]        = True
+    # Dirty: 1% truncated description (simulate partial write)
+    if dirty and random.random() < 0.01 and product.get("description"):
+        desc = product["description"]
+        product["description"] = desc[:random.randint(10, 30)]
 
-    # Add dispute details if disputed
-    if charge["disputed"]:
-        charge["dispute"] = {
-            "id":     f"dp_{uuid.uuid4().hex[:16]}",
-            "amount": amount,
-            "reason": random.choice(["fraudulent", "not_as_described", "unrecognized"]),
-            "status": random.choice(["needs_response", "under_review", "won", "lost"]),
-        }
+    # Dirty: 0.5% wrong type for price
+    if dirty and random.random() < 0.005:
+        product["base_price_pence"] = str(price_pence)  # String instead of int
 
-    # Build the full PaymentIntent object
-    payment_intent = {
-        "id":                      pi_id,
-        "object":                  "payment_intent",
-        "amount":                  amount,
-        "amount_capturable":       0,
-        "amount_received":         amount if stripe_status == "succeeded" else 0,
-        "currency":                currency,
-        "status":                  stripe_status,
-        "capture_method":          "automatic",
-        "confirmation_method":     "automatic",
-        "payment_method_types":    ["card"],
-        "payment_method":          f"pm_{str(payment_id).zfill(16)}",
+    return product
 
-        # Metadata — this is how we join back to our internal order
-        "metadata": {
-            "order_id":   str(order_id),
-            "payment_id": str(payment_id),
-            "source":     "ecommerce-platform",
-        },
 
-        "charges": {
-            "object":   "list",
-            "data":     [charge],
-            "has_more": False,
-            "total_count": 1,
-        },
-
-        "created":        int(created_at.timestamp()),
-        "created_at_iso": created_at.isoformat(),
-        "livemode":       False,  # Always false in our dev environment
-
-        # Dirty mode: 2% future timestamps
-        "created_at_iso": (
-            "2099-01-01T00:00:00+00:00"
-            if dirty and random.random() < 0.02
-            else created_at.isoformat()
-        ),
+def build_price_history(sku: str, created_at: datetime, current_price: int) -> dict:
+    return {
+        "product_sku": sku,
+        "price_pence": current_price,
+        "changed_at":  created_at.isoformat(),
+        "reason":      random.choice(["promotion", "restock", "market_adjustment"]),
     }
 
-    return payment_intent
-
 
 # ─────────────────────────────────────────────────────────────
-# OUTPUT — Write JSON files (Bronze landing zone pattern)
+# BURST MODE
 # ─────────────────────────────────────────────────────────────
 
-def write_page(records: list[dict], output_dir: Path, page_num: int,
-               ts: datetime) -> Path:
-    """
-    Write a page of Stripe records as JSON.
-    Structure mirrors how real Stripe API pagination works.
-    """
-    date_path = output_dir / ts.strftime("%Y/%m/%d/%H")
-    date_path.mkdir(parents=True, exist_ok=True)
-
-    file_path = date_path / f"stripe_page_{page_num:04d}.json"
-
-    payload = {
-        "object":   "list",
-        "data":     records,
-        "has_more": False,
-        "url":      "/v1/payment_intents",
-        "fetched_at": ts.isoformat(),
-        "page":     page_num,
-    }
-
-    with open(file_path, "w") as f:
-        json.dump(payload, f, default=str)
-
-    return file_path
-
-
-# ─────────────────────────────────────────────────────────────
-# BURST MODE (Rules 1, 2, 3, 4, 5)
-# ─────────────────────────────────────────────────────────────
-
-def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
+def run_burst(days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    t0 = time.time()
+    t0     = time.time()
+    client = MongoClient(MONGO_URI)
+    db     = client[DB_NAME]
+    col    = db[COLLECTION]
+    hcol   = db[HISTORY_COL]
+    stats  = {"upserted": 0, "history": 0}
 
-    log.info("Fetching payments from Postgres...")
-    pg_payments = fetch_payments_from_postgres(days)
-    log.info(f"  Found {len(pg_payments)} payments to simulate")
+    now = datetime.now(timezone.utc)
+    ops = []
+    history_ops = []
 
-    if not pg_payments:
-        log.error("No payments found in Postgres. Run the Postgres generator first.")
-        sys.exit(1)
+    for sku in PRODUCT_SKUS:
+        days_ago   = random.uniform(0, days)
+        created_at = now - timedelta(days=days_ago)
+        product    = build_product(sku, created_at, dirty)
 
-    stats       = {"written": 0, "quarantined": 0, "pages": 0}
-    page_size   = 100  # Stripe returns up to 100 per page
-    page_num    = 0
-    page_buffer = []
+        # Rule 5: upsert by _id — safe to run twice
+        ops.append(UpdateOne({"_id": sku}, {"$set": product}, upsert=True))
 
-    for pg_payment in pg_payments:
-        record = build_stripe_payment_intent(pg_payment, dirty)
+        # Price history
+        if isinstance(product.get("base_price_pence"), int):
+            history_ops.append(build_price_history(
+                sku, created_at, product["base_price_pence"]
+            ))
+            stats["history"] += 1
 
-        if not record:
-            quarantine(output_dir, "invalid_amount",
-                       {"payment_id": pg_payment["payment_id"],
-                        "amount": pg_payment["amount_pence"]})
-            stats["quarantined"] += 1
-            continue
+        stats["upserted"] += 1
 
-        page_buffer.append(record)
-        stats["written"] += 1
+    # Bulk write
+    if ops:
+        try:
+            result = col.bulk_write(ops, ordered=False)
+            log.info(f"  Products upserted: {result.upserted_count + result.modified_count}")
+        except BulkWriteError as e:
+            log.error(f"Bulk write error: {e.details}")
 
-        # Write page when full
-        if len(page_buffer) >= page_size:
-            ts = pg_payment["created_at"]
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts)
-            write_page(page_buffer, output_dir, page_num,
-                       ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts)
-            stats["pages"] += 1
-            page_num    += 1
-            page_buffer  = []
+    if history_ops:
+        hcol.insert_many(history_ops)
 
-    # Write remaining records
-    if page_buffer:
-        write_page(page_buffer, output_dir, page_num,
-                   datetime.now(timezone.utc))
-        stats["pages"] += 1
-
+    client.close()
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
-    log.info(f"  Output: {output_dir}")
-
-    if elapsed > 120:
-        log.warning(f"Rule 2 VIOLATION: {elapsed:.0f}s > 120s")
-    else:
-        log.info(f"Rule 2 ✅ {elapsed:.1f}s < 120s")
+    log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 
 # ─────────────────────────────────────────────────────────────
-# STREAM MODE (Rules 1, 6)
+# STREAM MODE — simulate ongoing catalog changes
 # ─────────────────────────────────────────────────────────────
 
-def run_stream(output_dir: Path, dirty: bool = False):
-    log.info(f"STREAM MODE | ~10K records/day | dirty={dirty} | Ctrl+C to stop")
-
-    # Load a pool of payments to simulate against
-    pg_payments = fetch_payments_from_postgres(days=7)
-    if not pg_payments:
-        log.error("No payments in Postgres. Run burst first.")
-        sys.exit(1)
-
-    stats, i = {"written": 0, "quarantined": 0}, 0
+def run_stream(dirty: bool = False):
+    log.info(f"STREAM MODE | ~10K/day | dirty={dirty} | Ctrl+C to stop")
+    client = MongoClient(MONGO_URI)
+    db     = client[DB_NAME]
+    col    = db[COLLECTION]
+    hcol   = db[HISTORY_COL]
+    stats  = {"updates": 0}
+    i      = 0
 
     try:
         while True:
-            i += 1
-            pg_payment = random.choice(pg_payments)
-            record     = build_stripe_payment_intent(pg_payment, dirty)
+            i   += 1
+            sku  = random.choice(PRODUCT_SKUS)
+            now  = datetime.now(timezone.utc)
 
-            if not record:
-                quarantine(output_dir, "invalid_amount", pg_payment)
-                stats["quarantined"] += 1
+            # Simulate: price change, stock update, or status change
+            change_type = random.choice(["price", "stock", "status"])
+
+            if change_type == "price":
+                new_price = random.randint(499, 29999)
+                col.update_one(
+                    {"_id": sku},
+                    {"$set": {
+                        "base_price_pence": new_price,
+                        "updated_at": now.isoformat()
+                    }},
+                    upsert=True
+                )
+                hcol.insert_one(build_price_history(sku, now, new_price))
+
+            elif change_type == "stock":
+                col.update_one(
+                    {"_id": sku},
+                    {"$set": {
+                        "updated_at": now.isoformat()
+                    },
+                     "$inc": {"variants.0.stock": random.randint(-5, 50)}},
+                    upsert=True
+                )
             else:
-                ts = datetime.now(timezone.utc)
-                write_page([record], output_dir, i, ts)
-                stats["written"] += 1
+                col.update_one(
+                    {"_id": sku},
+                    {"$set": {
+                        "status":     random.choice(["active", "low_stock"]),
+                        "updated_at": now.isoformat(),
+                    }},
+                    upsert=True
+                )
 
+            stats["updates"] += 1
             if i % 100 == 0:
                 log.info(f"Stream — {stats}")
-
             time.sleep(STREAM_SLEEP)
 
     except KeyboardInterrupt:
+        client.close()
         log.info(f"Stopped. {stats}")
 
 
 # ─────────────────────────────────────────────────────────────
-# ENTRY POINT (Rules 1, 10)
+# ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description="Source 06 — Stripe API generator")
-    p.add_argument("--mode",       choices=["burst", "stream"], required=True)
-    p.add_argument("--days",       type=int, default=7)
-    p.add_argument("--dirty",      action="store_true")
-    p.add_argument("--output-dir", type=str,
-                   default=os.environ.get("STRIPE_OUTPUT_DIR", "/tmp/stripe_raw"))
+    p = argparse.ArgumentParser(description="Source 03 — MongoDB Product Catalog")
+    p.add_argument("--mode",  choices=["burst","stream"], required=True)
+    p.add_argument("--days",  type=int, default=7)
+    p.add_argument("--dirty", action="store_true")
     args = p.parse_args()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"Source 06 | mode={args.mode} | days={args.days} | "
-             f"dirty={args.dirty} | output={output_dir}")
-
-    if args.mode == "burst":
-        run_burst(output_dir, args.days, args.dirty)
-    elif args.mode == "stream":
-        run_stream(output_dir, args.dirty)
-
+    log.info(f"Source 03 | mode={args.mode} | days={args.days} | dirty={args.dirty}")
+    if args.mode == "burst":   run_burst(args.days, args.dirty)
+    elif args.mode == "stream": run_stream(args.dirty)
 
 if __name__ == "__main__":
     main()

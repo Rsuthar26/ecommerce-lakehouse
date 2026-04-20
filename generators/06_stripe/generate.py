@@ -1,33 +1,32 @@
 """
 generators/06_stripe/generate.py — Staff DE Journey: Source 06
 
-Simulates Stripe API responses for payments, charges, refunds, disputes.
-Reads real order/payment data from Postgres to ensure joinability.
-Outputs JSON files to S3 (or local path for dev) — Bronze layer.
+Simulates Stripe API payment objects: charges, refunds, disputes.
+Reads real order/payment data from Postgres to ensure join integrity.
 
 Real Stripe ingestion pattern:
-  1. Airflow triggers this job on a schedule (hourly)
-  2. Job calls stripe.PaymentIntent.list(created_after=last_run_ts)
-  3. Paginate through results
-  4. Write each page as a JSON file to S3: raw/stripe/YYYY/MM/DD/HH/page_N.json
-  5. Databricks Autoloader picks up new files → Bronze table
+  1. Stripe sends webhook events to our API endpoint
+  2. API writes to SQS, Lambda processes → S3 raw
+  3. Or: Airflow polls Stripe API → writes Parquet to S3 raw
+  4. Databricks reads → Bronze table: bronze.stripe_raw
 
 Rules satisfied:
     Rule 1  — --mode burst and --mode stream
-    Rule 2  — burst produces 7 days, < 2 minutes
-    Rule 3  — timestamps backdated realistically
-    Rule 4  — payment status reflects age
-    Rule 5  — idempotent (payment_intent_id is stable)
-    Rule 6  — stream ~0.12 ops/sec (~10K records/day)
-    Rule 7  — dirty data + quarantine file
+    Rule 2  — burst < 2 minutes
+    Rule 3  — payment timestamps follow order creation times
+    Rule 4  — charge/refund status reflects age of payment
+    Rule 5  — idempotent (payment_intent_id is stable key)
+    Rule 6  — stream: ~10K/day (STREAM_SLEEP = 86400/10000)
+    Rule 7  — dirty: failed charges, disputed payments, missing fields
     Rule 8  — README.md exists
-    Rule 9  — connection via environment variables
+    Rule 9  — env vars: PG_HOST etc (for Rule 11 loading)
     Rule 10 — callable from single bash line
+    Rule 11 — reads real order_ids and payment amounts from Postgres
 
 Usage:
-    python generate.py --mode burst --output-dir /tmp/stripe_output
-    python generate.py --mode burst --dirty --output-dir /tmp/stripe_output
-    python generate.py --mode stream --output-dir /tmp/stripe_output
+    python generate.py --mode burst --output-dir /tmp/stripe_raw
+    python generate.py --mode burst --dirty --output-dir /tmp/stripe_raw
+    python generate.py --mode stream --output-dir /tmp/stripe_raw
 """
 
 import os
@@ -37,58 +36,65 @@ import time
 import random
 import logging
 import argparse
-import uuid
+import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import psycopg2
-import psycopg2.extras
 from faker import Faker
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from generators.shared.postgres_ids import load_entity_ids
+
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
 fake = Faker("en_GB")
 Faker.seed(42)
 
-STREAM_SLEEP = 1.0 / (10000 / 86400)  # ~10K records/day
+STREAM_SLEEP = 86400 / 10000   # Rule 6 + Rule 13
 
-CARD_BRANDS   = ["visa", "mastercard", "amex", "discover"]
-CARD_NETWORKS = ["visa", "mastercard", "amex"]
-CURRENCIES    = ["gbp"]
-FAILURE_CODES = [
-    "insufficient_funds", "card_declined", "expired_card",
+PAYMENT_METHODS = ["card", "paypal", "klarna", "bank_transfer"]
+CARD_BRANDS     = ["visa", "mastercard", "amex", "maestro"]
+CURRENCIES      = ["GBP"]
+FAILURE_CODES   = [
+    "card_declined", "insufficient_funds", "expired_card",
     "incorrect_cvc", "processing_error", "do_not_honor"
 ]
+DISPUTE_REASONS = [
+    "fraudulent", "duplicate", "product_not_received",
+    "product_unacceptable", "subscription_canceled"
+]
+
+_entity_ids = None
+
+def get_entity_ids():
+    global _entity_ids
+    if _entity_ids is None:
+        _entity_ids = load_entity_ids()
+    return _entity_ids
+
 
 # ─────────────────────────────────────────────────────────────
-# RULE 4 — STATUS REFLECTS AGE
+# RULE 3 + 4 — TIMESTAMPS AND STATUS REFLECT AGE
 # ─────────────────────────────────────────────────────────────
 
-def stripe_status_for_age(created_at: datetime, order_status: str) -> str:
-    """Stripe payment status must be consistent with order age and status."""
+def payment_timestamp(base_dt: datetime) -> datetime:
+    """Payments happen 0-30 minutes after order placement."""
+    offset = timedelta(minutes=random.randint(0, 30))
+    return (base_dt + offset).replace(tzinfo=timezone.utc)
+
+def charge_status_for_age(created_at: datetime) -> str:
     age_hrs = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
-
-    if order_status in ("cancelled", "refunded"):
-        return random.choices(
-            ["canceled", "requires_payment_method"],
-            weights=[0.7, 0.3]
-        )[0]
-    elif age_hrs < 1:
-        return "requires_confirmation"
-    elif age_hrs < 3:
-        return "processing"
+    if age_hrs < 0.5:
+        return random.choices(["pending", "succeeded"], weights=[0.3, 0.7])[0]
     else:
         return random.choices(
-            ["succeeded", "succeeded", "succeeded", "requires_payment_method"],
-            weights=[0.92, 0.02, 0.03, 0.03]
+            ["succeeded", "failed", "disputed"],
+            weights=[0.92, 0.06, 0.02]
         )[0]
 
 
@@ -96,370 +102,205 @@ def stripe_status_for_age(created_at: datetime, order_status: str) -> str:
 # RULE 7 — DIRTY DATA
 # ─────────────────────────────────────────────────────────────
 
-def dr(base, dirty, elevated):
-    return elevated if dirty else base
+def dr(base, dirty, elevated): return elevated if dirty else base
+def maybe_null(v, dirty, base=0.05, elev=0.20):
+    return None if random.random() < dr(base, dirty, elev) else v
 
-def bad_amount(amount, dirty):
-    if random.random() < dr(0.005, dirty, 0.08):
-        return random.choice([0, -1, None, "free", 999999999])
+def dirty_amount(amount, dirty):
+    if random.random() < dr(0.005, dirty, 0.05):
+        return random.choice([0, -100, 999999900])
     return amount
 
-def bad_currency(dirty):
-    if random.random() < dr(0.01, dirty, 0.10):
-        return random.choice(["GBP", "gbP", "usd", "EUR", None, ""])
-    return "gbp"
-
-def missing_field(value, dirty, base=0.05, elev=0.20):
-    return None if random.random() < dr(base, dirty, elev) else value
-
 
 # ─────────────────────────────────────────────────────────────
-# QUARANTINE — written to a separate JSON file
+# STRIPE OBJECT BUILDER
 # ─────────────────────────────────────────────────────────────
 
-def quarantine(output_dir: Path, reason: str, data: dict):
-    q_dir  = output_dir / "quarantine"
-    q_dir.mkdir(parents=True, exist_ok=True)
-    q_file = q_dir / f"quarantine_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json"
-    with open(q_file, "w") as f:
-        json.dump({"reason": reason, "data": data,
-                   "ts": datetime.now(timezone.utc).isoformat()}, f)
-    log.warning(f"QUARANTINE {reason[:80]}")
+def build_stripe_charge(created_at: datetime, dirty: bool = False) -> dict:
+    ids           = get_entity_ids()
+    order_id      = random.choice(ids["order_ids"]) if ids["order_ids"] else None
+    amount_pence  = dirty_amount(random.randint(999, 99999), dirty)
+    status        = charge_status_for_age(created_at)
+    method        = random.choice(PAYMENT_METHODS)
 
+    # Stripe payment intent ID — stable for Rule 5
+    pi_id = f"pi_{hashlib.md5(f'order_{order_id}_{created_at.date()}'.encode()).hexdigest()[:24]}"
 
-# ─────────────────────────────────────────────────────────────
-# POSTGRES CONNECTION (Rule 9)
-# Read real order/payment data to ensure joinability
-# ─────────────────────────────────────────────────────────────
-
-def get_pg_connection():
-    return psycopg2.connect(
-        host=os.environ["DB_HOST"],
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ.get("DB_NAME", "ecommerce"),
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        connect_timeout=10,
-    )
-
-
-def fetch_payments_from_postgres(days: int = 7) -> list[dict]:
-    """
-    Fetch real payment records from Postgres.
-    These are the source of truth for order IDs and amounts.
-    Stripe records must reference the same IDs.
-    """
-    conn = get_pg_connection()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    p.payment_id,
-                    p.order_id,
-                    p.amount_pence,
-                    p.currency,
-                    p.payment_status,
-                    p.payment_method,
-                    p.card_last4,
-                    p.card_brand,
-                    p.created_at,
-                    o.order_status,
-                    o.placed_at
-                FROM payments p
-                JOIN orders o ON p.order_id = o.order_id
-                WHERE p.created_at >= NOW() - INTERVAL '%s days'
-                ORDER BY p.created_at DESC
-            """, (days,))
-            rows = cur.fetchall()
-            return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-# ─────────────────────────────────────────────────────────────
-# STRIPE RECORD BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_stripe_payment_intent(pg_payment: dict, dirty: bool = False) -> dict:
-    """
-    Build a realistic Stripe PaymentIntent object based on a Postgres payment record.
-    The payment_intent_id is derived from payment_id — stable and joinable.
-
-    In production: Stripe generates pi_XXXX IDs. We simulate this by
-    using a deterministic format based on our payment_id.
-    """
-    payment_id   = pg_payment["payment_id"]
-    order_id     = pg_payment["order_id"]
-    amount_pence = pg_payment["amount_pence"]
-    created_at   = pg_payment["created_at"]
-    order_status = pg_payment["order_status"]
-
-    # Deterministic payment intent ID — same payment always gets same Stripe ID
-    # This is critical for idempotency (Rule 5)
-    pi_id     = f"pi_{str(payment_id).zfill(8)}{str(order_id).zfill(8)}"
-    charge_id = f"ch_{str(payment_id).zfill(8)}{str(order_id).zfill(6)}"
-
-    stripe_status = stripe_status_for_age(created_at, order_status)
-    amount        = bad_amount(amount_pence, dirty)
-    currency      = bad_currency(dirty)
-
-    # Validate
-    if amount is None or not isinstance(amount, int) or amount <= 0:
-        return None  # caller quarantines
-
-    card_brand = pg_payment.get("card_brand") or random.choice(CARD_BRANDS)
-    card_last4 = pg_payment.get("card_last4") or str(random.randint(1000, 9999))
-
-    # Stripe charge object (nested inside payment intent)
     charge = {
-        "id":                charge_id,
-        "object":            "charge",
-        "amount":            amount,
-        "amount_captured":   amount if stripe_status == "succeeded" else 0,
-        "amount_refunded":   0,
-        "currency":          currency,
-        "captured":          stripe_status == "succeeded",
-        "disputed":          random.random() < 0.002,  # 0.2% dispute rate
-        "paid":              stripe_status == "succeeded",
-        "refunded":          False,
-        "status":            "succeeded" if stripe_status == "succeeded" else "failed",
-        "failure_code":      random.choice(FAILURE_CODES) if stripe_status != "succeeded" else None,
-        "failure_message":   None,
-        "payment_method_details": {
-            "card": {
-                "brand":      card_brand,
-                "last4":      card_last4,
-                "exp_month":  missing_field(random.randint(1, 12), dirty),
-                "exp_year":   missing_field(random.randint(2025, 2030), dirty),
-                "country":    missing_field("GB", dirty),
-                "funding":    random.choice(["credit", "debit", "prepaid"]),
-                "network":    missing_field(card_brand, dirty),
-            },
-            "type": "card"
+        "object":        "charge",
+        "id":            f"ch_{fake.uuid4().replace('-','')[:24]}",
+        "payment_intent": maybe_null(pi_id, dirty, base=0.01),
+        "amount":         amount_pence,
+        "amount_captured": amount_pence if status == "succeeded" else 0,
+        "amount_refunded": 0,
+        "currency":       "gbp",
+        "status":         status,
+        "paid":           status == "succeeded",
+        "captured":       status == "succeeded",
+        "created":        int(created_at.timestamp()),
+        "created_at":     created_at.isoformat(),
+
+        # Metadata — joins back to our order
+        "metadata": {
+            "order_id":   maybe_null(str(order_id), dirty, base=0.01),
+            "customer_id": maybe_null(
+                str(random.choice(ids["customer_ids"])) if ids["customer_ids"] else None,
+                dirty
+            ),
         },
+
+        "payment_method_details": {
+            "type": method,
+            "card": {
+                "brand":        maybe_null(random.choice(CARD_BRANDS), dirty),
+                "last4":        maybe_null(str(random.randint(1000,9999)), dirty),
+                "exp_month":    random.randint(1, 12),
+                "exp_year":     random.randint(2025, 2030),
+                "country":      maybe_null("GB", dirty),
+                "funding":      random.choice(["credit","debit"]),
+                "cvc_check":    maybe_null("pass", dirty),
+            } if method == "card" else None,
+        },
+
         "billing_details": {
-            "name":    missing_field(fake.name(), dirty),
-            "email":   missing_field(fake.email(), dirty),
+            "name":    maybe_null(fake.name(), dirty),
+            "email":   maybe_null(fake.email(), dirty),
             "address": {
-                "city":        missing_field(fake.city(), dirty),
-                "country":     missing_field("GB", dirty),
-                "postal_code": missing_field(fake.postcode(), dirty),
-                "line1":       missing_field(fake.street_address(), dirty),
+                "line1":       maybe_null(fake.street_address(), dirty),
+                "city":        maybe_null(fake.city(), dirty),
+                "postal_code": maybe_null(fake.postcode(), dirty),
+                "country":     "GB",
             }
         },
-        "created": int(created_at.timestamp()),
+
+        "receipt_url": f"https://pay.stripe.com/receipts/{fake.uuid4()}",
+        "description": f"Order #{order_id}",
+        "livemode":    False,
+        "source":      "ecommerce-platform",
     }
 
-    # Add refund if order is refunded
-    if order_status == "refunded":
-        charge["amount_refunded"] = amount
-        charge["refunded"]        = True
+    if status == "failed":
+        charge["failure_code"]    = maybe_null(random.choice(FAILURE_CODES), dirty)
+        charge["failure_message"] = maybe_null(
+            "Your card was declined. Contact your bank.", dirty)
 
-    # Add dispute details if disputed
-    if charge["disputed"]:
+    if status == "disputed":
         charge["dispute"] = {
-            "id":     f"dp_{uuid.uuid4().hex[:16]}",
-            "amount": amount,
-            "reason": random.choice(["fraudulent", "not_as_described", "unrecognized"]),
-            "status": random.choice(["needs_response", "under_review", "won", "lost"]),
+            "id":      f"dp_{fake.uuid4().replace('-','')[:24]}",
+            "amount":  amount_pence,
+            "reason":  maybe_null(random.choice(DISPUTE_REASONS), dirty),
+            "status":  random.choice(["warning_needs_response","under_review","won","lost"]),
         }
 
-    # Build the full PaymentIntent object
-    payment_intent = {
-        "id":                      pi_id,
-        "object":                  "payment_intent",
-        "amount":                  amount,
-        "amount_capturable":       0,
-        "amount_received":         amount if stripe_status == "succeeded" else 0,
-        "currency":                currency,
-        "status":                  stripe_status,
-        "capture_method":          "automatic",
-        "confirmation_method":     "automatic",
-        "payment_method_types":    ["card"],
-        "payment_method":          f"pm_{str(payment_id).zfill(16)}",
+    # Refund object (5% of succeeded charges get refunded)
+    if status == "succeeded" and random.random() < 0.05:
+        refund_amount = int(amount_pence * random.uniform(0.1, 1.0))
+        charge["refunds"] = [{
+            "id":      f"re_{fake.uuid4().replace('-','')[:24]}",
+            "amount":  refund_amount,
+            "status":  "succeeded",
+            "reason":  random.choice(["duplicate","fraudulent","requested_by_customer"]),
+            "created": int((created_at + timedelta(hours=random.randint(1,72))).timestamp()),
+        }]
+        charge["amount_refunded"] = refund_amount
 
-        # Metadata — this is how we join back to our internal order
-        "metadata": {
-            "order_id":   str(order_id),
-            "payment_id": str(payment_id),
-            "source":     "ecommerce-platform",
-        },
+    # Dirty: 2% future timestamps
+    if dirty and random.random() < 0.02:
+        charge["created_at"] = "2099-01-01T00:00:00+00:00"
 
-        "charges": {
-            "object":   "list",
-            "data":     [charge],
-            "has_more": False,
-            "total_count": 1,
-        },
-
-        "created":        int(created_at.timestamp()),
-        "created_at_iso": created_at.isoformat(),
-        "livemode":       False,  # Always false in our dev environment
-
-        # Dirty mode: 2% future timestamps
-        "created_at_iso": (
-            "2099-01-01T00:00:00+00:00"
-            if dirty and random.random() < 0.02
-            else created_at.isoformat()
-        ),
-    }
-
-    return payment_intent
+    return charge
 
 
 # ─────────────────────────────────────────────────────────────
-# OUTPUT — Write JSON files (Bronze landing zone pattern)
+# OUTPUT
 # ─────────────────────────────────────────────────────────────
 
-def write_page(records: list[dict], output_dir: Path, page_num: int,
-               ts: datetime) -> Path:
-    """
-    Write a page of Stripe records as JSON.
-    Structure mirrors how real Stripe API pagination works.
-    """
+def write_batch(charges: list, output_dir: Path, batch_num: int, ts: datetime):
     date_path = output_dir / ts.strftime("%Y/%m/%d/%H")
     date_path.mkdir(parents=True, exist_ok=True)
-
-    file_path = date_path / f"stripe_page_{page_num:04d}.json"
-
-    payload = {
-        "object":   "list",
-        "data":     records,
-        "has_more": False,
-        "url":      "/v1/payment_intents",
-        "fetched_at": ts.isoformat(),
-        "page":     page_num,
-    }
-
+    file_path = date_path / f"stripe_charges_{batch_num:04d}.json"
     with open(file_path, "w") as f:
-        json.dump(payload, f, default=str)
-
-    return file_path
+        json.dump({
+            "batch":      batch_num,
+            "count":      len(charges),
+            "source":     "stripe",
+            "fetched_at": ts.isoformat(),
+            "charges":    charges,
+        }, f, default=str)
 
 
 # ─────────────────────────────────────────────────────────────
-# BURST MODE (Rules 1, 2, 3, 4, 5)
+# BURST MODE
 # ─────────────────────────────────────────────────────────────
 
 def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    t0 = time.time()
+    get_entity_ids()
+    t0     = time.time()
+    stats  = {"charges": 0, "batches": 0}
+    now    = datetime.now(timezone.utc)
+    total  = days * 1500   # ~10K/day, sample for burst speed
+    batch_size = 100
+    buffer, batch_num = [], 0
 
-    log.info("Fetching payments from Postgres...")
-    pg_payments = fetch_payments_from_postgres(days)
-    log.info(f"  Found {len(pg_payments)} payments to simulate")
+    for _ in range(total):
+        days_ago   = random.uniform(0, days)
+        base_dt    = now - timedelta(days=days_ago)
+        created_at = payment_timestamp(base_dt)
+        charge     = build_stripe_charge(created_at, dirty)
+        buffer.append(charge)
+        stats["charges"] += 1
 
-    if not pg_payments:
-        log.error("No payments found in Postgres. Run the Postgres generator first.")
-        sys.exit(1)
+        if len(buffer) >= batch_size:
+            write_batch(buffer, output_dir, batch_num, created_at)
+            stats["batches"] += 1
+            batch_num += 1
+            buffer = []
 
-    stats       = {"written": 0, "quarantined": 0, "pages": 0}
-    page_size   = 100  # Stripe returns up to 100 per page
-    page_num    = 0
-    page_buffer = []
-
-    for pg_payment in pg_payments:
-        record = build_stripe_payment_intent(pg_payment, dirty)
-
-        if not record:
-            quarantine(output_dir, "invalid_amount",
-                       {"payment_id": pg_payment["payment_id"],
-                        "amount": pg_payment["amount_pence"]})
-            stats["quarantined"] += 1
-            continue
-
-        page_buffer.append(record)
-        stats["written"] += 1
-
-        # Write page when full
-        if len(page_buffer) >= page_size:
-            ts = pg_payment["created_at"]
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts)
-            write_page(page_buffer, output_dir, page_num,
-                       ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts)
-            stats["pages"] += 1
-            page_num    += 1
-            page_buffer  = []
-
-    # Write remaining records
-    if page_buffer:
-        write_page(page_buffer, output_dir, page_num,
-                   datetime.now(timezone.utc))
-        stats["pages"] += 1
+    if buffer:
+        write_batch(buffer, output_dir, batch_num, datetime.now(timezone.utc))
+        stats["batches"] += 1
 
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
-    log.info(f"  Output: {output_dir}")
-
-    if elapsed > 120:
-        log.warning(f"Rule 2 VIOLATION: {elapsed:.0f}s > 120s")
-    else:
-        log.info(f"Rule 2 ✅ {elapsed:.1f}s < 120s")
+    log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 
 # ─────────────────────────────────────────────────────────────
-# STREAM MODE (Rules 1, 6)
+# STREAM MODE
 # ─────────────────────────────────────────────────────────────
 
 def run_stream(output_dir: Path, dirty: bool = False):
-    log.info(f"STREAM MODE | ~10K records/day | dirty={dirty} | Ctrl+C to stop")
-
-    # Load a pool of payments to simulate against
-    pg_payments = fetch_payments_from_postgres(days=7)
-    if not pg_payments:
-        log.error("No payments in Postgres. Run burst first.")
-        sys.exit(1)
-
-    stats, i = {"written": 0, "quarantined": 0}, 0
-
+    log.info(f"STREAM MODE | ~10K/day | dirty={dirty} | Ctrl+C to stop")
+    get_entity_ids()
+    stats, i = {"charges": 0}, 0
     try:
         while True:
-            i += 1
-            pg_payment = random.choice(pg_payments)
-            record     = build_stripe_payment_intent(pg_payment, dirty)
-
-            if not record:
-                quarantine(output_dir, "invalid_amount", pg_payment)
-                stats["quarantined"] += 1
-            else:
-                ts = datetime.now(timezone.utc)
-                write_page([record], output_dir, i, ts)
-                stats["written"] += 1
-
+            i     += 1
+            now    = datetime.now(timezone.utc)
+            charge = build_stripe_charge(now, dirty)
+            write_batch([charge], output_dir, i, now)
+            stats["charges"] += 1
             if i % 100 == 0:
                 log.info(f"Stream — {stats}")
-
             time.sleep(STREAM_SLEEP)
-
     except KeyboardInterrupt:
         log.info(f"Stopped. {stats}")
 
 
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT (Rules 1, 10)
-# ─────────────────────────────────────────────────────────────
-
 def main():
-    p = argparse.ArgumentParser(description="Source 06 — Stripe API generator")
-    p.add_argument("--mode",       choices=["burst", "stream"], required=True)
+    p = argparse.ArgumentParser(description="Source 06 — Stripe Payments")
+    p.add_argument("--mode",       choices=["burst","stream"], required=True)
     p.add_argument("--days",       type=int, default=7)
     p.add_argument("--dirty",      action="store_true")
     p.add_argument("--output-dir", type=str,
                    default=os.environ.get("STRIPE_OUTPUT_DIR", "/tmp/stripe_raw"))
     args = p.parse_args()
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"Source 06 | mode={args.mode} | days={args.days} | "
-             f"dirty={args.dirty} | output={output_dir}")
-
-    if args.mode == "burst":
-        run_burst(output_dir, args.days, args.dirty)
-    elif args.mode == "stream":
-        run_stream(output_dir, args.dirty)
-
+    log.info(f"Source 06 | mode={args.mode} | days={args.days} | dirty={args.dirty}")
+    if args.mode == "burst":   run_burst(output_dir, args.days, args.dirty)
+    elif args.mode == "stream": run_stream(output_dir, args.dirty)
 
 if __name__ == "__main__":
     main()

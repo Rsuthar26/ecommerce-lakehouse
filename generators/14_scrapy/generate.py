@@ -4,370 +4,157 @@ generators/14_scrapy/generate.py — Staff DE Journey: Source 14
 Simulates Scrapy web scraping output for competitor pricing,
 stock availability, and promotional data.
 
-Why scraping data is different from API data:
-  - No schema guarantee — website changes break the scraper silently
-  - HTML parsing errors produce partial/garbled data
-  - Anti-scraping measures cause random failures and empty responses
-  - Data is stale by definition (scraped at a point in time)
-  - Prices change faster than scrape frequency
+~2K records/day — scraped from 3 fictional competitors.
 
-Real Scrapy ingestion pattern:
-  1. Scrapy spider runs on schedule (every 6 hours via Airflow)
-  2. Scrapy pipeline writes items to S3: raw/competitor_pricing/YYYY/MM/DD/
-  3. Each run creates one JSON file per competitor domain
-  4. Databricks reads → Bronze table
-  5. Silver layer deduplicates, normalises prices, detects price changes
-
-Legal note: always check robots.txt + ToS before scraping in production.
-For this project we simulate the output — no actual scraping.
-
-Rules satisfied:
-    Rule 1  — --mode burst and --mode stream
-    Rule 2  — burst < 2 minutes
-    Rule 3  — timestamps reflect scrape schedule (every 6 hours)
-    Rule 4  — prices reflect market conditions over time
-    Rule 5  — idempotent (url + scraped_at = dedup key)
-    Rule 6  — stream ~0.023 ops/sec (~2K records/day)
-    Rule 7  — dirty data: parse failures, partial records, stale data
-    Rule 8  — README.md exists
-    Rule 9  — connection via environment variables
-    Rule 10 — callable from single bash line
-
-Usage:
-    python generate.py --mode burst --output-dir /tmp/competitor_raw
-    python generate.py --mode burst --dirty --output-dir /tmp/competitor_raw
-    python generate.py --mode stream --output-dir /tmp/competitor_raw
+Rules: All 11 satisfied.
 """
 
-import os
-import json
-import time
-import random
-import logging
-import argparse
+import os, sys, json, time, random, logging, argparse, hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
 from faker import Faker
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from generators.shared.postgres_ids import load_entity_ids
+
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+fake = Faker("en_GB"); Faker.seed(42)
 
-fake = Faker("en_GB")
-Faker.seed(42)
-
-STREAM_SLEEP = 1.0 / (2000 / 86400)  # ~2K records/day
-
-PRODUCT_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
+STREAM_SLEEP = 86400 / 2000
 
 COMPETITORS = [
-    {
-        "domain":    "techgadgets.co.uk",
-        "name":      "TechGadgets UK",
-        "currency":  "GBP",
-        "price_adj": 1.05,   # Slightly more expensive
-    },
-    {
-        "domain":    "officedepot.co.uk",
-        "name":      "Office Depot UK",
-        "currency":  "GBP",
-        "price_adj": 0.95,   # Slightly cheaper
-    },
-    {
-        "domain":    "amazonuk.example.com",
-        "name":      "Amazon UK (3P)",
-        "currency":  "GBP",
-        "price_adj": 0.90,   # Often cheaper
-    },
-    {
-        "domain":    "currys.example.com",
-        "name":      "Currys",
-        "currency":  "GBP",
-        "price_adj": 1.10,   # More expensive
-    },
-    {
-        "domain":    "argos.example.com",
-        "name":      "Argos",
-        "currency":  "GBP",
-        "price_adj": 1.00,   # Same price
-    },
+    {"id": "COMP-001", "name": "TechDirect UK",   "domain": "techdirect.co.uk"},
+    {"id": "COMP-002", "name": "GadgetHub",        "domain": "gadgethub.com"},
+    {"id": "COMP-003", "name": "ValueElectronics", "domain": "valueelectronics.co.uk"},
 ]
 
-PRODUCT_NAMES = [
-    "Wireless Headphones", "USB-C Hub", "Laptop Stand",
-    "Mechanical Keyboard", "Mouse Pad XL", "Webcam HD",
-    "Monitor Arm", "Cable Organiser", "Power Bank 20000mAh",
-    "Smart Plug", "LED Desk Lamp", "Phone Stand",
-]
+AVAILABILITY = ["in_stock","in_stock","in_stock","low_stock","out_of_stock","discontinued"]
 
-AVAILABILITY = ["in_stock", "in_stock", "in_stock", "low_stock",
-                "out_of_stock", "pre_order"]
+# Rule 4 — availability skews to in_stock for recent scrapes, out_of_stock for older data
+def availability_for_age(scraped_at: datetime) -> str:
+    age_days = (datetime.now(timezone.utc) - scraped_at).days
+    if age_days < 1:
+        return random.choices(
+            ["in_stock","low_stock","out_of_stock"],
+            weights=[0.75, 0.15, 0.10]
+        )[0]
+    elif age_days < 7:
+        return random.choices(
+            ["in_stock","low_stock","out_of_stock","discontinued"],
+            weights=[0.65, 0.15, 0.15, 0.05]
+        )[0]
+    else:
+        return random.choices(
+            ["in_stock","low_stock","out_of_stock","discontinued"],
+            weights=[0.55, 0.15, 0.20, 0.10]
+        )[0]
 
-SCRAPY_ERRORS = [
-    "HTTP 429: Too Many Requests",
-    "HTTP 403: Forbidden",
-    "Timeout after 30s",
-    "CSS selector '.price' returned no results",
-    "Price element not found in DOM",
-    "Anti-bot challenge detected",
-    "Empty response body",
-]
+_entity_ids = None
+def get_entity_ids():
+    global _entity_ids
+    if _entity_ids is None: _entity_ids = load_entity_ids()
+    return _entity_ids
 
-
-# ─────────────────────────────────────────────────────────────
-# RULE 3 — SCRAPE SCHEDULE (every 6 hours)
-# ─────────────────────────────────────────────────────────────
-
-def scrape_timestamp(base_dt: datetime) -> datetime:
-    """Scrapes run every 6 hours: 00:00, 06:00, 12:00, 18:00."""
-    hour = random.choice([0, 6, 12, 18])
-    return base_dt.replace(hour=hour, minute=random.randint(0, 30),
-                           second=random.randint(0, 59), tzinfo=timezone.utc)
-
-def backdate(days_ago: float) -> datetime:
-    return datetime.now(timezone.utc) - timedelta(days=days_ago)
-
-
-# ─────────────────────────────────────────────────────────────
-# RULE 7 — DIRTY DATA
-# Scraping produces the messiest data of all sources
-# ─────────────────────────────────────────────────────────────
-
-def dr(base, dirty, elevated):
-    return elevated if dirty else base
+def dr(base, dirty, elevated): return elevated if dirty else base
+def maybe_null(v, dirty, base=0.05, elev=0.20):
+    return None if random.random() < dr(base, dirty, elev) else v
 
 def dirty_price(price, dirty):
-    """Scraping often picks up non-price text near price elements."""
-    if random.random() < dr(0.02, dirty, 0.15):
-        return random.choice([
-            "£" + str(price),          # Currency symbol not stripped
-            str(price) + " inc VAT",   # Extra text
-            "Was £" + str(price),      # Promotional text
-            None,                       # Selector found nothing
-            "",                         # Empty string
-            "Price on request",         # Non-numeric
-        ])
-    return str(price)
+    if random.random() < dr(0.01, dirty, 0.08):
+        return random.choice(["POA","TBC","N/A",None,"free"])
+    return price
 
-def dirty_availability(avail, dirty):
-    if random.random() < dr(0.01, dirty, 0.10):
-        return random.choice([
-            "Add to Basket",    # Button text instead of availability
-            "Check store",      # Not a standard value
-            None,
-            "",
-            "✓ In Stock",       # With HTML entities
-        ])
-    return avail
+def build_price_record(scraped_at: datetime, dirty: bool = False) -> dict:
+    ids         = get_entity_ids()
+    sku         = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+    competitor  = random.choice(COMPETITORS)
+    our_price   = random.randint(499, 29999)
+    # Competitor prices 5-25% above or below ours
+    comp_price  = int(our_price * random.uniform(0.75, 1.25))
+    availability = availability_for_age(scraped_at)
 
-def maybe_null(value, dirty, base=0.05, elev=0.20):
-    if random.random() < dr(base, dirty, elev):
-        return None
-    return value
-
-def maybe_scrape_failure(dirty) -> bool:
-    """Simulate spider failure — returns True if this item failed to scrape."""
-    return random.random() < dr(0.05, dirty, 0.20)
-
-
-# ─────────────────────────────────────────────────────────────
-# SCRAPY ITEM BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_scraped_item(competitor: dict, scraped_at: datetime,
-                       dirty: bool = False) -> dict:
-    """
-    Build one Scrapy item — what the spider pipeline writes after
-    scraping a product page.
-    """
-    sku        = random.choice(PRODUCT_SKUS)
-    base_price = random.randint(499, 29999) / 100
-    comp_price = round(base_price * competitor["price_adj"] * random.uniform(0.9, 1.1), 2)
-    avail      = random.choice(AVAILABILITY)
-
-    # Simulate scrape failure
-    if maybe_scrape_failure(dirty):
-        return {
-            "scraped_at":     scraped_at.isoformat(),
-            "competitor":     competitor["domain"],
-            "url":            f"https://{competitor['domain']}/products/{sku}",
-            "product_sku":    sku,
-            "scrape_status":  "failed",
-            "error":          random.choice(SCRAPY_ERRORS),
-            "spider_name":    f"{competitor['domain'].replace('.', '_')}_spider",
-            "spider_version": "1.0.0",
-        }
-
-    return {
-        "scraped_at":           scraped_at.isoformat(),
-        "competitor":           competitor["domain"],
-        "competitor_name":      competitor["name"],
-        "url":                  f"https://{competitor['domain']}/products/{sku.lower()}",
-        "product_sku":          sku,                    # Join key to our catalog
-        "product_name":         maybe_null(
-            random.choice(PRODUCT_NAMES), dirty),
-        "price":                dirty_price(comp_price, dirty),
-        "original_price":       maybe_null(
-            str(round(comp_price * 1.2, 2)), dirty),    # Was/RRP price
-        "currency":             competitor["currency"],
-        "availability":         dirty_availability(avail, dirty),
-        "in_stock":             avail in ("in_stock", "low_stock"),
-        "stock_count":          maybe_null(
-            random.randint(0, 100) if avail != "out_of_stock" else 0,
-            dirty),
-        "rating":               maybe_null(
-            round(random.uniform(3.0, 5.0), 1), dirty),
-        "review_count":         maybe_null(random.randint(0, 500), dirty),
-        "promotions":           maybe_null(
-            random.choice([
-                None, "10% off", "Buy 2 get 1 free",
-                "Free delivery", "Student discount"
-            ]), dirty),
-        "delivery_days":        maybe_null(random.randint(1, 14), dirty),
-        "seller":               maybe_null(competitor["name"], dirty),
-        "scrape_status":        "success",
-        "spider_name":          f"{competitor['domain'].replace('.', '_')}_spider",
-        "spider_version":       "1.0.0",
-        "response_time_ms":     maybe_null(random.randint(200, 5000), dirty),
-
-        # Metadata for Silver layer processing
-        "_scrapy_item_id":      f"{competitor['domain']}_{sku}_{scraped_at.strftime('%Y%m%d%H')}",
-        "_price_parsed":        False,  # Silver layer sets this to True after parsing
-        "_price_numeric":       None,   # Silver layer populates this
+    record = {
+        "record_id":         hashlib.md5(
+            f"{competitor['id']}:{sku}:{scraped_at.date()}".encode()
+        ).hexdigest()[:16],
+        "scraped_at":        scraped_at.isoformat(),
+        "competitor_id":     competitor["id"],
+        "competitor_name":   maybe_null(competitor["name"], dirty),
+        "competitor_domain": competitor["domain"],
+        "product_sku":       maybe_null(sku, dirty, base=0.01),
+        "competitor_sku":    maybe_null(f"{competitor['id']}-{random.randint(10000,99999)}", dirty),
+        "product_title":     maybe_null(fake.catch_phrase(), dirty),
+        "price_pence":       dirty_price(comp_price, dirty),
+        "our_price_pence":   our_price,
+        "price_difference_pct": round((comp_price - our_price) / our_price * 100, 2),
+        "availability":      maybe_null(availability, dirty),
+        "url":               maybe_null(f"https://{competitor['domain']}/product/{sku.lower()}", dirty),
+        "promo_active":      random.random() < 0.15,
+        "promo_text":        maybe_null(
+            f"Save {random.randint(10,40)}% this week!" if random.random() < 0.15 else None,
+            dirty
+        ),
+        "rating":            maybe_null(round(random.uniform(3.0, 5.0), 1), dirty),
+        "review_count":      maybe_null(random.randint(0, 500), dirty),
+        "currency":          "GBP",
+        "_source":           "scrapy",
+        # Dirty: 2% future timestamps
+        **( {"scraped_at": "2099-01-01T00:00:00+00:00"} if dirty and random.random() < 0.02 else {} ),
     }
 
+    # Dirty: 1% malformed — missing required field
+    if dirty and random.random() < 0.01:
+        record.pop("competitor_id", None)
 
-# ─────────────────────────────────────────────────────────────
-# OUTPUT — Scrapy pipeline writes one file per spider run
-# ─────────────────────────────────────────────────────────────
+    return record
 
-def write_spider_output(items: list, competitor: dict,
-                        output_dir: Path, scraped_at: datetime) -> None:
-    date_path = output_dir / scraped_at.strftime("%Y/%m/%d/%H")
-    date_path.mkdir(parents=True, exist_ok=True)
-    filename  = (f"{competitor['domain'].replace('.', '_')}"
-                 f"_{scraped_at.strftime('%Y%m%d_%H%M%S')}.json")
-    file_path = date_path / filename
+def write_batch(records, output_dir, batch_num, ts):
+    dp = output_dir / ts.strftime("%Y/%m/%d"); dp.mkdir(parents=True, exist_ok=True)
+    with open(dp / f"competitor_prices_{batch_num:04d}.json","w") as f:
+        json.dump({"batch": batch_num, "count": len(records),
+                   "scraped_at": ts.isoformat(), "records": records}, f, default=str)
 
-    with open(file_path, "w") as f:
-        json.dump({
-            "spider":       competitor["domain"],
-            "scraped_at":   scraped_at.isoformat(),
-            "item_count":   len(items),
-            "success_count": sum(1 for i in items if i.get("scrape_status") == "success"),
-            "fail_count":    sum(1 for i in items if i.get("scrape_status") == "failed"),
-            "items":        items,
-        }, f, default=str)
-
-
-# ─────────────────────────────────────────────────────────────
-# BURST MODE
-# ─────────────────────────────────────────────────────────────
-
-def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
-    log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    t0    = time.time()
-    stats = {"files": 0, "items": 0, "failures": 0}
-
-    # Each competitor spider runs 4x per day (every 6 hours)
-    for day_offset in range(days):
-        base_dt = backdate(day_offset)
-
-        for run_hour in [0, 6, 12, 18]:
-            scraped_at = base_dt.replace(
-                hour=run_hour,
-                minute=random.randint(0, 15),
-                second=0,
-                tzinfo=timezone.utc
-            )
-
-            for competitor in COMPETITORS:
-                # Each spider scrapes 50-150 products per run
-                num_items = random.randint(50, 150)
-                items = [
-                    build_scraped_item(competitor, scraped_at, dirty)
-                    for _ in range(num_items)
-                ]
-
-                write_spider_output(items, competitor, output_dir, scraped_at)
-                stats["files"] += 1
-                stats["items"] += num_items
-                stats["failures"] += sum(
-                    1 for i in items if i.get("scrape_status") == "failed"
-                )
-
+def run_burst(output_dir, days=7, dirty=False):
+    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
+    t0, stats, now = time.time(), {"records":0,"batches":0}, datetime.now(timezone.utc)
+    total, batch_size, buf, bn = days * 300, 100, [], 0
+    for _ in range(total):
+        days_ago   = random.uniform(0, days)
+        scraped_at = now - timedelta(days=days_ago)
+        record     = build_price_record(scraped_at, dirty)
+        buf.append(record); stats["records"] += 1
+        if len(buf) >= batch_size:
+            write_batch(buf, output_dir, bn, scraped_at); bn += 1; buf = []
+    if buf: write_batch(buf, output_dir, bn, datetime.now(timezone.utc)); stats["batches"] = bn+1
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
-    if elapsed > 120:
-        log.warning(f"Rule 2 VIOLATION: {elapsed:.0f}s > 120s")
-    else:
-        log.info(f"Rule 2 ✅ {elapsed:.1f}s < 120s")
+    log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
-
-# ─────────────────────────────────────────────────────────────
-# STREAM MODE
-# ─────────────────────────────────────────────────────────────
-
-def run_stream(output_dir: Path, dirty: bool = False):
-    log.info(f"STREAM MODE | ~2K records/day | dirty={dirty} | Ctrl+C to stop")
-
-    stats, i = {"files": 0, "items": 0}, 0
-
+def run_stream(output_dir, dirty=False):
+    log.info(f"STREAM MODE | ~2K/day | dirty={dirty} | Ctrl+C to stop")
+    get_entity_ids(); stats, i = {"records":0}, 0
     try:
         while True:
-            i          += 1
-            now         = datetime.now(timezone.utc)
-            competitor  = random.choice(COMPETITORS)
-            num_items   = random.randint(20, 50)
-            items       = [
-                build_scraped_item(competitor, now, dirty)
-                for _ in range(num_items)
-            ]
-
-            write_spider_output(items, competitor, output_dir, now)
-            stats["files"] += 1
-            stats["items"] += num_items
-
-            if i % 10 == 0:
-                log.info(f"Stream — {stats}")
-
-            time.sleep(STREAM_SLEEP * num_items)
-
-    except KeyboardInterrupt:
-        log.info(f"Stopped. {stats}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────
+            i += 1; now = datetime.now(timezone.utc)
+            record = build_price_record(now, dirty)
+            write_batch([record], output_dir, i, now)
+            stats["records"] += 1
+            if i % 100 == 0: log.info(f"Stream — {stats}")
+            time.sleep(STREAM_SLEEP)
+    except KeyboardInterrupt: log.info(f"Stopped. {stats}")
 
 def main():
-    p = argparse.ArgumentParser(description="Source 14 — Scrapy competitor pricing generator")
-    p.add_argument("--mode",       choices=["burst", "stream"], required=True)
-    p.add_argument("--days",       type=int, default=7)
-    p.add_argument("--dirty",      action="store_true")
-    p.add_argument("--output-dir", type=str,
-                   default=os.environ.get("SCRAPY_OUTPUT_DIR", "/tmp/competitor_raw"))
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["burst","stream"], required=True)
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--dirty", action="store_true")
+    p.add_argument("--output-dir", type=str, default=os.environ.get("SCRAPY_OUTPUT_DIR","/tmp/scrapy_raw"))
     args = p.parse_args()
+    od = Path(args.output_dir); od.mkdir(parents=True, exist_ok=True)
+    if args.mode == "burst": run_burst(od, args.days, args.dirty)
+    else: run_stream(od, args.dirty)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"Source 14 | mode={args.mode} | days={args.days} | "
-             f"dirty={args.dirty} | output={output_dir}")
-
-    if args.mode == "burst":
-        run_burst(output_dir, args.days, args.dirty)
-    elif args.mode == "stream":
-        run_stream(output_dir, args.dirty)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

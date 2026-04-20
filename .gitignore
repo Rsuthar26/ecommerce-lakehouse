@@ -13,3 +13,4 @@ terraform/terraform.tfvars
 terraform/*.backup
 terraform/.idea/
 generators/.DS_Store
+.DS_Store

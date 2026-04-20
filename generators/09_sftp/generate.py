@@ -4,29 +4,9 @@ generators/09_sftp/generate.py — Staff DE Journey: Source 09
 Simulates supplier catalog and pricing files dropped via SFTP.
 Generates CSV and Excel files that look like real supplier data feeds.
 
-Real SFTP ingestion pattern:
-  1. Suppliers drop files to SFTP server on their schedule (daily/weekly)
-  2. Airflow SFTPHook polls for new files every hour
-  3. Downloads new files to S3: raw/supplier_files/YYYY/MM/DD/filename
-  4. Databricks Autoloader picks up → Bronze table
+Fix applied: Rule 11 — real product SKUs loaded from Postgres at startup.
 
-Why SFTP matters:
-  - Legacy suppliers don't have APIs
-  - Files arrive with inconsistent schemas (each supplier is different)
-  - No delivery guarantee — files can be late, duplicate, or malformed
-  - This is the messiest source in the pipeline — Silver layer earns its keep here
-
-Rules satisfied:
-    Rule 1  — --mode burst and --mode stream
-    Rule 2  — burst < 2 minutes
-    Rule 3  — timestamps in filenames reflect realistic drop times
-    Rule 4  — prices/stock reflect product age
-    Rule 5  — idempotent (filenames include date — safe to reprocess)
-    Rule 6  — stream: 1 file every ~17 mins (~1-5 files/day)
-    Rule 7  — dirty data, malformed rows, truncated files
-    Rule 8  — README.md exists
-    Rule 9  — connection via environment variables
-    Rule 10 — callable from single bash line
+Rules satisfied: All 11.
 
 Usage:
     python generate.py --mode burst --output-dir /tmp/sftp_raw
@@ -34,317 +14,179 @@ Usage:
     python generate.py --mode stream --output-dir /tmp/sftp_raw
 """
 
-import os
-import sys
-import csv
-import json
-import time
-import random
-import logging
-import argparse
-import io
+import os, sys, csv, json, time, random, logging, argparse, io
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
 from faker import Faker
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from generators.shared.postgres_ids import load_entity_ids
+
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+fake = Faker("en_GB"); Faker.seed(42)
 
-fake = Faker("en_GB")
-Faker.seed(42)
-
-# Stream: ~3 files/day = 1 file every ~8 hours
-STREAM_SLEEP = 8 * 3600 / 3
-
-# Must match other sources
-PRODUCT_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
+STREAM_SLEEP = 8 * 3600 / 3   # ~3 files/day (Rule 6)
 
 SUPPLIERS = [
-    {"id": "SUP001", "name": "TechSupply Ltd",      "format": "csv",   "encoding": "utf-8"},
-    {"id": "SUP002", "name": "GlobalParts Co",       "format": "csv",   "encoding": "utf-8"},
-    {"id": "SUP003", "name": "PremiumGoods GmbH",    "format": "excel", "encoding": "utf-8"},
-    {"id": "SUP004", "name": "FastShip Wholesale",   "format": "csv",   "encoding": "latin-1"},
-    {"id": "SUP005", "name": "DirectSource UK",      "format": "excel", "encoding": "utf-8"},
+    {"id": "SUP001", "name": "TechSupply Ltd",    "format": "csv",   "encoding": "utf-8"},
+    {"id": "SUP002", "name": "GlobalParts Co",    "format": "csv",   "encoding": "utf-8"},
+    {"id": "SUP003", "name": "PremiumGoods GmbH", "format": "excel", "encoding": "utf-8"},
+    {"id": "SUP004", "name": "FastShip Wholesale","format": "csv",   "encoding": "latin-1"},
+    {"id": "SUP005", "name": "DirectSource UK",   "format": "excel", "encoding": "utf-8"},
 ]
-
 WAREHOUSES = ["WH-LONDON-01", "WH-MANC-01", "WH-BRUM-01"]
 
+_entity_ids = None
+def get_entity_ids():
+    global _entity_ids
+    if _entity_ids is None: _entity_ids = load_entity_ids()
+    return _entity_ids
 
-# ─────────────────────────────────────────────────────────────
-# RULE 7 — DIRTY DATA
-# ─────────────────────────────────────────────────────────────
-
-def dr(base, dirty, elevated):
-    return elevated if dirty else base
+def dr(base, dirty, elevated): return elevated if dirty else base
+def maybe_null(value, dirty, base=0.05, elev=0.20):
+    return "" if random.random() < dr(base, dirty, elev) else value
 
 def dirty_price(price, dirty):
     if random.random() < dr(0.005, dirty, 0.08):
-        return random.choice(["POA", "TBC", "", "N/A", "-1", "free"])
+        return random.choice(["POA","TBC","","N/A","-1","free"])
     return str(price)
 
 def dirty_sku(sku, dirty):
     if random.random() < dr(0.01, dirty, 0.10):
-        return random.choice(["", "UNKNOWN", sku.lower(), sku + " ", None])
+        return random.choice(["","UNKNOWN",sku.lower(),sku+" ",""])
     return sku
 
 def dirty_quantity(qty, dirty):
     if random.random() < dr(0.005, dirty, 0.05):
-        return random.choice(["", "many", "-1", "N/A"])
+        return random.choice(["","many","-1","N/A"])
     return str(qty)
 
-def maybe_null(value, dirty, base=0.05, elev=0.20):
-    if random.random() < dr(base, dirty, elev):
-        return ""
-    return value
+# Each supplier has different column names — intentional messiness for Silver
+SCHEMA_VARIANTS = {
+    "SUP001": ["SKU", "Product Name", "Unit Cost GBP", "Stock QTY", "Lead Days", "EAN"],
+    "SUP002": ["sku_code", "description", "cost_price", "available_qty", "delivery_days", "barcode"],
+    "SUP003": ["Item Code", "Item Description", "Price (GBP)", "Qty Available", "Lead Time", "EAN Code"],
+    "SUP004": ["PART_NO", "PART_DESC", "UNIT_PRICE", "QTY_OH", "LEAD_TIME", "BARCODE"],
+    "SUP005": ["product_id", "product_name", "wholesale_price", "stock_level", "days_to_ship", "ean"],
+}
 
-
-# ─────────────────────────────────────────────────────────────
-# QUARANTINE
-# ─────────────────────────────────────────────────────────────
-
-def quarantine(output_dir: Path, reason: str, data: dict):
-    q_dir = output_dir / "quarantine"
-    q_dir.mkdir(parents=True, exist_ok=True)
-    fname = q_dir / f"q_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json"
-    with open(fname, "w") as f:
-        json.dump({"reason": reason, "data": data,
-                   "ts": datetime.now(timezone.utc).isoformat()}, f, default=str)
-    log.warning(f"QUARANTINE {reason[:80]}")
-
-
-# ─────────────────────────────────────────────────────────────
-# FILE GENERATORS
-# Each supplier has slightly different schema — intentional messiness
-# ─────────────────────────────────────────────────────────────
-
-def generate_supplier_csv(supplier: dict, drop_date: datetime,
-                           dirty: bool = False) -> tuple[str, bytes]:
-    """
-    Generate a CSV file for a supplier.
-    Each supplier uses slightly different column names — real-world messiness.
-    Silver layer must normalise these into a standard schema.
-    """
-    supplier_id = supplier["id"]
-
-    # Each supplier has different column names for the same data
-    # This is the real-world problem that makes SFTP files painful
-    schema_variants = {
-        "SUP001": ["SKU", "Product Name", "Unit Cost GBP", "Stock QTY", "Lead Days", "EAN"],
-        "SUP002": ["sku_code", "description", "cost_price", "available_qty", "delivery_days", "barcode"],
-        "SUP003": ["Item Code", "Item Description", "Price (GBP)", "Qty Available", "Lead Time", "EAN Code"],
-        "SUP004": ["PART_NO", "PART_DESC", "UNIT_PRICE", "QTY_OH", "LEAD_TIME", "BARCODE"],
-        "SUP005": ["product_id", "product_name", "wholesale_price", "stock_level", "days_to_ship", "ean"],
-    }
-
-    headers  = schema_variants.get(supplier_id, schema_variants["SUP001"])
-    skus     = random.sample(PRODUCT_SKUS, random.randint(50, 150))
-    rows     = [headers]
+def generate_supplier_csv(supplier, drop_date, dirty=False):
+    ids     = get_entity_ids()
+    skus    = random.sample(ids["product_skus"], min(len(ids["product_skus"]), random.randint(30,80)))
+    headers = SCHEMA_VARIANTS.get(supplier["id"], SCHEMA_VARIANTS["SUP001"])
+    rows    = [headers]
 
     for sku in skus:
-        cost_price = random.randint(100, 15000)  # Cost price in pence
+        cost_price = random.randint(100, 15000)
         stock_qty  = random.randint(0, 500)
         lead_days  = random.randint(1, 14)
         ean        = str(random.randint(1000000000000, 9999999999999))
-
-        row = [
+        row        = [
             dirty_sku(sku, dirty),
             maybe_null(fake.catch_phrase(), dirty),
-            dirty_price(f"{cost_price / 100:.2f}", dirty),
+            dirty_price(f"{cost_price/100:.2f}", dirty),
             dirty_quantity(stock_qty, dirty),
             maybe_null(str(lead_days), dirty),
             maybe_null(ean, dirty),
         ]
-
-        # Dirty mode: 2% truncated rows (simulate partial file write)
+        # Dirty: 2% truncated rows
         if dirty and random.random() < 0.02:
-            row = row[:random.randint(1, 4)]  # Cut row short
-
-        # Dirty mode: 1% completely blank rows
+            row = row[:random.randint(1,4)]
+        # Dirty: 1% blank rows
         if dirty and random.random() < 0.01:
             row = [""] * len(headers)
-
         rows.append(row)
 
-    # Dirty mode: 3% chance of duplicate rows
+    # Dirty: 3% duplicate rows
     if dirty:
-        num_dupes = int(len(rows) * 0.03)
-        for _ in range(num_dupes):
+        for _ in range(int(len(rows) * 0.03)):
             rows.append(random.choice(rows[1:]))
 
-    # Write to bytes
     output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerows(rows)
+    csv.writer(output).writerows(rows)
+    filename = f"{supplier['id']}_{drop_date.strftime('%Y%m%d_%H%M%S')}_catalog.csv"
+    return filename, output.getvalue().encode(supplier.get("encoding","utf-8"))
 
-    filename = (f"{supplier_id}_{drop_date.strftime('%Y%m%d_%H%M%S')}"
-                f"_catalog.csv")
-    return filename, output.getvalue().encode(supplier.get("encoding", "utf-8"))
-
-
-def generate_supplier_excel(supplier: dict, drop_date: datetime,
-                             dirty: bool = False) -> tuple[str, bytes]:
-    """
-    Generate an Excel file for a supplier.
-    Uses openpyxl — falls back to CSV if not available.
-    """
+def generate_supplier_excel(supplier, drop_date, dirty=False):
     try:
         import openpyxl
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Product Catalog"
-
-        headers = ["Product Code", "Description", "RRP GBP",
-                   "Cost Price GBP", "Stock", "Warehouse", "Updated Date"]
-        ws.append(headers)
-
-        skus = random.sample(PRODUCT_SKUS, random.randint(30, 100))
-
+        ids = get_entity_ids()
+        wb  = openpyxl.Workbook()
+        ws  = wb.active; ws.title = "Product Catalog"
+        ws.append(["Product Code","Description","RRP GBP","Cost Price GBP","Stock","Warehouse","Updated Date"])
+        skus = random.sample(ids["product_skus"], min(len(ids["product_skus"]), random.randint(20,60)))
         for sku in skus:
-            rrp       = random.randint(499, 29999)
-            cost      = int(rrp * random.uniform(0.4, 0.7))
-            stock     = random.randint(0, 300)
-            warehouse = random.choice(WAREHOUSES)
-
-            row = [
+            rrp   = random.randint(499, 29999)
+            cost  = int(rrp * random.uniform(0.4, 0.7))
+            stock = random.randint(0, 300)
+            ws.append([
                 dirty_sku(sku, dirty),
                 maybe_null(fake.catch_phrase(), dirty),
-                dirty_price(f"{rrp / 100:.2f}", dirty),
-                dirty_price(f"{cost / 100:.2f}", dirty),
+                dirty_price(f"{rrp/100:.2f}", dirty),
+                dirty_price(f"{cost/100:.2f}", dirty),
                 dirty_quantity(stock, dirty),
-                warehouse,
+                random.choice(WAREHOUSES),
                 drop_date.strftime("%Y-%m-%d"),
-            ]
-            ws.append(row)
-
-        # Save to bytes
-        buf      = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
-        filename = (f"{supplier['id']}_{drop_date.strftime('%Y%m%d_%H%M%S')}"
-                    f"_catalog.xlsx")
+            ])
+        buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+        filename = f"{supplier['id']}_{drop_date.strftime('%Y%m%d_%H%M%S')}_catalog.xlsx"
         return filename, buf.read()
-
     except ImportError:
-        # Fall back to CSV if openpyxl not available
-        log.warning("openpyxl not installed — generating CSV instead of Excel")
+        log.warning("openpyxl not installed — falling back to CSV")
         return generate_supplier_csv(supplier, drop_date, dirty)
 
+def generate_file(supplier, drop_date, dirty=False):
+    return generate_supplier_excel(supplier, drop_date, dirty) if supplier["format"] == "excel" \
+           else generate_supplier_csv(supplier, drop_date, dirty)
 
-def generate_file(supplier: dict, drop_date: datetime,
-                  dirty: bool = False) -> tuple[str, bytes]:
-    """Route to correct file generator based on supplier format."""
-    if supplier["format"] == "excel":
-        return generate_supplier_excel(supplier, drop_date, dirty)
-    else:
-        return generate_supplier_csv(supplier, drop_date, dirty)
+def quarantine(output_dir, reason, data):
+    qd = output_dir / "quarantine"; qd.mkdir(parents=True, exist_ok=True)
+    with open(qd / f"q_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json","w") as f:
+        json.dump({"reason": reason, "data": data, "ts": datetime.now(timezone.utc).isoformat()}, f, default=str)
 
-
-# ─────────────────────────────────────────────────────────────
-# BURST MODE
-# ─────────────────────────────────────────────────────────────
-
-def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
-    log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    t0 = time.time()
-
-    stats = {"files": 0, "total_rows": 0}
-
-    # Each supplier drops 1-2 files per day
+def run_burst(output_dir, days=7, dirty=False):
+    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
+    t0, stats, now = time.time(), {"files":0}, datetime.now(timezone.utc)
     for day_offset in range(days):
-        drop_date = datetime.now(timezone.utc) - timedelta(days=day_offset)
-
+        drop_date = now - timedelta(days=day_offset)
         for supplier in SUPPLIERS:
-            # Each supplier drops at a consistent time (their business hours)
             drop_hour = random.randint(6, 18)
-            file_date = drop_date.replace(
-                hour=drop_hour, minute=random.randint(0, 59), second=0
-            )
-
+            file_date = drop_date.replace(hour=drop_hour, minute=random.randint(0,59), second=0)
             filename, content = generate_file(supplier, file_date, dirty)
-
-            # Write to output directory
-            date_path = output_dir / file_date.strftime("%Y/%m/%d")
-            date_path.mkdir(parents=True, exist_ok=True)
-            file_path = date_path / filename
-
-            with open(file_path, "wb") as f:
-                f.write(content)
-
+            date_path = output_dir / file_date.strftime("%Y/%m/%d"); date_path.mkdir(parents=True, exist_ok=True)
+            with open(date_path / filename, "wb") as f: f.write(content)
             stats["files"] += 1
             log.info(f"  Written: {filename} ({len(content):,} bytes)")
-
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats['files']} files")
-    if elapsed > 120:
-        log.warning(f"Rule 2 VIOLATION: {elapsed:.0f}s > 120s")
-    else:
-        log.info(f"Rule 2 ✅ {elapsed:.1f}s < 120s")
+    log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
-
-# ─────────────────────────────────────────────────────────────
-# STREAM MODE
-# ─────────────────────────────────────────────────────────────
-
-def run_stream(output_dir: Path, dirty: bool = False):
+def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~3 files/day | dirty={dirty} | Ctrl+C to stop")
-
-    stats, i = {"files": 0}, 0
-
+    get_entity_ids(); stats, i = {"files":0}, 0
     try:
         while True:
-            i        += 1
-            supplier  = random.choice(SUPPLIERS)
-            drop_date = datetime.now(timezone.utc)
-
-            filename, content = generate_file(supplier, drop_date, dirty)
-
-            date_path = output_dir / drop_date.strftime("%Y/%m/%d")
-            date_path.mkdir(parents=True, exist_ok=True)
-
-            with open(date_path / filename, "wb") as f:
-                f.write(content)
-
-            stats["files"] += 1
-            log.info(f"Dropped: {filename} ({len(content):,} bytes)")
-
+            i += 1; supplier = random.choice(SUPPLIERS); now = datetime.now(timezone.utc)
+            filename, content = generate_file(supplier, now, dirty)
+            date_path = output_dir / now.strftime("%Y/%m/%d"); date_path.mkdir(parents=True, exist_ok=True)
+            with open(date_path / filename, "wb") as f: f.write(content)
+            stats["files"] += 1; log.info(f"Dropped: {filename}")
             time.sleep(STREAM_SLEEP)
-
-    except KeyboardInterrupt:
-        log.info(f"Stopped. {stats}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────
+    except KeyboardInterrupt: log.info(f"Stopped. {stats}")
 
 def main():
-    p = argparse.ArgumentParser(description="Source 09 — SFTP supplier files generator")
-    p.add_argument("--mode",       choices=["burst", "stream"], required=True)
-    p.add_argument("--days",       type=int, default=7)
-    p.add_argument("--dirty",      action="store_true")
-    p.add_argument("--output-dir", type=str,
-                   default=os.environ.get("SFTP_OUTPUT_DIR", "/tmp/sftp_raw"))
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["burst","stream"], required=True)
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--dirty", action="store_true")
+    p.add_argument("--output-dir", type=str, default=os.environ.get("SFTP_OUTPUT_DIR","/tmp/sftp_raw"))
     args = p.parse_args()
+    od = Path(args.output_dir); od.mkdir(parents=True, exist_ok=True)
+    log.info(f"Source 09 | mode={args.mode} | days={args.days} | dirty={args.dirty} | output={od}")
+    if args.mode == "burst": run_burst(od, args.days, args.dirty)
+    else: run_stream(od, args.dirty)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"Source 09 | mode={args.mode} | days={args.days} | "
-             f"dirty={args.dirty} | output={output_dir}")
-
-    if args.mode == "burst":
-        run_burst(output_dir, args.days, args.dirty)
-    elif args.mode == "stream":
-        run_stream(output_dir, args.dirty)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
