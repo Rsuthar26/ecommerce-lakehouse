@@ -157,7 +157,12 @@ def run_burst(output_dir, days=7, dirty=False):
             file_date = drop_date.replace(hour=drop_hour, minute=random.randint(0,59), second=0)
             filename, content = generate_file(supplier, file_date, dirty)
             date_path = output_dir / file_date.strftime("%Y/%m/%d"); date_path.mkdir(parents=True, exist_ok=True)
-            with open(date_path / filename, "wb") as f: f.write(content)
+            filepath = date_path / filename
+            if filepath.exists():  # Rule 5: idempotent — skip if already written
+                log.info(f"  Skipped (exists): {filename}")
+                continue
+            if filepath.exists(): continue  # Rule 5 — idempotent: skip if already written
+            with open(filepath, "wb") as f: f.write(content)
             stats["files"] += 1
             log.info(f"  Written: {filename} ({len(content):,} bytes)")
     elapsed = time.time() - t0

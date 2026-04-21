@@ -130,6 +130,10 @@ def run_burst(output_dir, days=7, dirty=False):
             date_path = output_dir / file_date.strftime("%Y/%m/%d"); date_path.mkdir(parents=True, exist_ok=True)
             ext      = "parquet" if partner["format"] == "parquet" else "avro"
             filepath = date_path / f"{partner['id']}_{file_date.strftime('%Y%m%d')}_sales.{ext}"
+            if filepath.exists():  # Rule 5: idempotent — skip if already written
+                log.info(f"  Skipped (exists): {filepath.name}")
+                continue
+            if filepath.exists(): continue  # Rule 5 — idempotent: skip if already written
             written  = write_parquet(rows, filepath) if partner["format"] == "parquet" else write_avro(rows, filepath)
             stats["files"] += 1; stats["total_rows"] += written
             log.info(f"  Written: {filepath.name} ({written} rows)")
