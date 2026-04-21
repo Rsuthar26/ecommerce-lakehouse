@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 fake = Faker("en_GB"); Faker.seed(42)
 
-STREAM_SLEEP = 8 * 3600 / 3   # ~3 files/day (Rule 6)
+STREAM_SLEEP = 86400 / 3   # Rule 13: ~3 files/day
 
 SUPPLIERS = [
     {"id": "SUP001", "name": "TechSupply Ltd",    "format": "csv",   "encoding": "utf-8"},
@@ -107,7 +107,7 @@ def generate_supplier_csv(supplier, drop_date, dirty=False):
 
     output = io.StringIO()
     csv.writer(output).writerows(rows)
-    filename = f"{supplier['id']}_{drop_date.strftime('%Y%m%d_%H%M%S')}_catalog.csv"
+    filename = f"{supplier['id']}_{drop_date.strftime('%Y%m%d')}_catalog.csv"
     return filename, output.getvalue().encode(supplier.get("encoding","utf-8"))
 
 def generate_supplier_excel(supplier, drop_date, dirty=False):
@@ -132,7 +132,7 @@ def generate_supplier_excel(supplier, drop_date, dirty=False):
                 drop_date.strftime("%Y-%m-%d"),
             ])
         buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-        filename = f"{supplier['id']}_{drop_date.strftime('%Y%m%d_%H%M%S')}_catalog.xlsx"
+        filename = f"{supplier['id']}_{drop_date.strftime('%Y%m%d')}_catalog.xlsx"
         return filename, buf.read()
     except ImportError:
         log.warning("openpyxl not installed — falling back to CSV")

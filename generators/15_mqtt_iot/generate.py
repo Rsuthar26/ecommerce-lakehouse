@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 
 # Rule 6 + Rule 13: 5 sensors × 8640 readings/day = 43,200/day
 # Burst samples 2K/day × 7 days = 14,000 events
-STREAM_SLEEP = 10.0 / 5  # 5 sensors each fire every 10s = 1 event every 2s
+STREAM_SLEEP = 86400 / 43200  # Rule 13: 5 sensors × 8640 readings/day = 43,200/day — 10s per round
 
 TOPIC   = "iot.telemetry"
 BROKERS = os.environ.get(
@@ -186,7 +186,7 @@ def run_stream(dirty=False):
             producer.flush()
             if i % 50 == 0:
                 log.info(f"Stream — {stats}")
-            time.sleep(10)
+            time.sleep(STREAM_SLEEP)
     except KeyboardInterrupt:
         producer.flush()
         producer.close()

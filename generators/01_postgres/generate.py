@@ -54,7 +54,7 @@ CARD_BRANDS     = ["visa", "mastercard", "amex"]
 PAYMENT_METHODS = ["card", "paypal", "klarna", "bank_transfer", "gift_card"]
 CHANNELS        = ["web", "web", "web", "mobile", "mobile", "api"]
 TIERS           = ["standard", "standard", "standard", "silver", "gold", "vip"]
-STREAM_SLEEP    = 1.0 / 0.6   # ~0.6 ops/sec = ~50K ops/day  (Rule 6)
+STREAM_SLEEP = 86400 / 50000  # Rule 13: ~1 order/sec = ~50K rows/day
 BURST_BATCH     = 100         # commit every N orders in burst mode
 VALID_STATUSES  = {'pending','confirmed','processing','shipped','delivered','cancelled','refunded'}
 

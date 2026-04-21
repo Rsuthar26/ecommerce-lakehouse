@@ -38,6 +38,9 @@ from datetime import datetime, timezone, timedelta
 from faker import Faker
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from generators.shared.postgres_ids import load_entity_ids
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO,
@@ -51,6 +54,8 @@ except ImportError:
     log.error("pymongo not installed: pip install pymongo")
     sys.exit(1)
 
+import hashlib
+
 fake = Faker("en_GB")
 Faker.seed(42)
 
@@ -60,7 +65,21 @@ DB_NAME      = os.environ.get("MONGO_DBNAME", "ecommerce")
 COLLECTION   = "products"
 HISTORY_COL  = "product_price_history"
 
-PRODUCT_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]  # Must match Postgres
+# Rule 11: loaded from Postgres at startup — not hardcoded
+# Fallback list used only if Postgres is unreachable
+_FALLBACK_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
+_entity_ids    = None
+
+def get_product_skus() -> list:
+    global _entity_ids
+    if _entity_ids is None:
+        try:
+            _entity_ids = load_entity_ids()
+            log.info(f"Rule 11 ✅ loaded {len(_entity_ids['product_skus'])} SKUs from Postgres")
+        except Exception as e:
+            log.warning(f"Rule 11 ⚠️ Postgres unavailable ({e}) — using fallback SKU list")
+            _entity_ids = {"product_skus": _FALLBACK_SKUS}
+    return _entity_ids["product_skus"]
 
 CATEGORIES = {
     "Electronics": {
@@ -196,7 +215,12 @@ def build_product(sku: str, created_at: datetime, dirty: bool = False) -> dict:
 
 
 def build_price_history(sku: str, created_at: datetime, current_price: int) -> dict:
+    # Rule 12: deterministic _id — safe to run burst twice without duplicating history
+    history_id = hashlib.md5(
+        f"{sku}:{created_at.strftime('%Y-%m-%d')}:{current_price}".encode()
+    ).hexdigest()
     return {
+        "_id":         history_id,
         "product_sku": sku,
         "price_pence": current_price,
         "changed_at":  created_at.isoformat(),
@@ -217,11 +241,12 @@ def run_burst(days: int = 7, dirty: bool = False):
     hcol   = db[HISTORY_COL]
     stats  = {"upserted": 0, "history": 0}
 
-    now = datetime.now(timezone.utc)
-    ops = []
-    history_ops = []
+    now          = datetime.now(timezone.utc)
+    ops          = []
+    history_ops  = []
+    product_skus = get_product_skus()  # Rule 11: real SKUs from Postgres
 
-    for sku in PRODUCT_SKUS:
+    for sku in product_skus:
         days_ago   = random.uniform(0, days)
         created_at = now - timedelta(days=days_ago)
         product    = build_product(sku, created_at, dirty)
@@ -229,11 +254,12 @@ def run_burst(days: int = 7, dirty: bool = False):
         # Rule 5: upsert by _id — safe to run twice
         ops.append(UpdateOne({"_id": sku}, {"$set": product}, upsert=True))
 
-        # Price history
+        # Rule 12: upsert history by deterministic _id — safe to run twice
         if isinstance(product.get("base_price_pence"), int):
-            history_ops.append(build_price_history(
-                sku, created_at, product["base_price_pence"]
-            ))
+            h = build_price_history(sku, created_at, product["base_price_pence"])
+            history_ops.append(
+                UpdateOne({"_id": h["_id"]}, {"$setOnInsert": h}, upsert=True)
+            )
             stats["history"] += 1
 
         stats["upserted"] += 1
@@ -247,7 +273,10 @@ def run_burst(days: int = 7, dirty: bool = False):
             log.error(f"Bulk write error: {e.details}")
 
     if history_ops:
-        hcol.insert_many(history_ops)
+        try:
+            hcol.bulk_write(history_ops, ordered=False)  # Rule 12: upsert not insert
+        except BulkWriteError as e:
+            log.error(f"History bulk write error: {e.details}")
 
     client.close()
     elapsed = time.time() - t0
@@ -271,7 +300,7 @@ def run_stream(dirty: bool = False):
     try:
         while True:
             i   += 1
-            sku  = random.choice(PRODUCT_SKUS)
+            sku  = random.choice(get_product_skus())
             now  = datetime.now(timezone.utc)
 
             # Simulate: price change, stock update, or status change

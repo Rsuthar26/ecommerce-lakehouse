@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 fake = Faker("en_GB"); Faker.seed(42)
 
-STREAM_SLEEP = 8 * 3600 / 3   # ~3 files/day (Rule 6)
+STREAM_SLEEP = 86400 / 3   # Rule 13: ~3 files/day
 
 PARTNERS = [
     {"id": "PARTNER-001", "name": "AffiliateNet UK",  "format": "parquet", "type": "affiliate"},
@@ -129,7 +129,7 @@ def run_burst(output_dir, days=7, dirty=False):
                 rows.append(build_sale_row(partner, sale_date, dirty))
             date_path = output_dir / file_date.strftime("%Y/%m/%d"); date_path.mkdir(parents=True, exist_ok=True)
             ext      = "parquet" if partner["format"] == "parquet" else "avro"
-            filepath = date_path / f"{partner['id']}_{file_date.strftime('%Y%m%d_%H%M%S')}_sales.{ext}"
+            filepath = date_path / f"{partner['id']}_{file_date.strftime('%Y%m%d')}_sales.{ext}"
             written  = write_parquet(rows, filepath) if partner["format"] == "parquet" else write_avro(rows, filepath)
             stats["files"] += 1; stats["total_rows"] += written
             log.info(f"  Written: {filepath.name} ({written} rows)")

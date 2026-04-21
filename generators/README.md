@@ -30,10 +30,10 @@ bash demo/start_demo.sh
 
 **Ingestion Pattern**
 ```
-┌──────────────┐  SQL query   ┌──────────────┐  write JSON  ┌──────────────┐
-│ PostgreSQL   │─────────────▶│   Airflow    │─────────────▶│   S3 Raw     │
-│ RDS          │  on schedule │   MWAA       │              │   Landing    │
-└──────────────┘              └──────────────┘              └──────────────┘
+┌──────────────┐  reads WAL   ┌──────────────┐  CDC events  ┌──────────────┐  Spark SS    ┌──────────────┐
+│ PostgreSQL   │─────────────▶│   Debezium   │─────────────▶│  Kafka MSK   │─────────────▶│   S3 Raw     │
+│ RDS          │              │   on EC2     │              │              │  micro-batch │   Landing    │
+└──────────────┘              └──────────────┘              └──────────────┘              └──────────────┘
 ```
 
 | | |
@@ -42,7 +42,7 @@ bash demo/start_demo.sh
 | **In the real world** | The live database behind the e-commerce app. Every order, payment, customer registration, and inventory update is written here instantly by the application. The data engineer never writes to it — only reads from it. |
 | **We simulate it with** | A generator that inserts realistic customers, orders, payments, and inventory rows into a real AWS RDS PostgreSQL instance with backdated timestamps and peak-hour patterns. |
 | **It simulates** | The live operational database at the core of every real e-commerce business. |
-| **How it works** | Airflow connects on a schedule, queries for records created or updated since the last run, and writes them as JSON to S3 partitioned by source and date. |
+| **How it works** | Debezium reads the PostgreSQL WAL continuously via a replication slot. Every INSERT, UPDATE, and DELETE becomes a CDC event published to MSK Kafka. Spark Structured Streaming consumes the topic and writes micro-batches to S3 Raw partitioned by table and date. |
 | **Dirty data** | Invalid emails, negative prices, nulls in required fields, placeholder strings like `free` or `TBD` in price columns. |
 | **Bronze table** | `bronze.cdc_orders` · `bronze.cdc_customers` · `bronze.cdc_payments` |
 
@@ -126,19 +126,19 @@ bash demo/start_demo.sh
 
 **Ingestion Pattern**
 ```
-┌──────────────┐  SQS queue   ┌──────────────┐  write JSON  ┌──────────────┐
-│ Application  │─────────────▶│    Lambda    │─────────────▶│   S3 Raw     │
-│              │              │              │              │   Landing    │
-└──────────────┘              └──────────────┘              └──────────────┘
+┌──────────────┐  SQS queue   ┌──────────────┐  Kafka topic ┌──────────────┐  Spark SS    ┌──────────────┐
+│ Application  │─────────────▶│    Lambda    │─────────────▶│  Kafka MSK   │─────────────▶│   S3 Raw     │
+│              │              │              │ order.events │              │  micro-batch │   Landing    │
+└──────────────┘              └──────────────┘              └──────────────┘              └──────────────┘
 ```
 
 | | |
 |---|---|
 | **Type** | Message queue — event-driven |
 | **In the real world** | When an order is placed the application puts a message on SQS. Multiple downstream systems each consume their own copy. If a consumer is temporarily down, messages wait safely in the queue. |
-| **We simulate it with** | A generator that produces order event JSON messages and puts them onto a real SQS queue. Lambda polls the queue, writes to S3 Raw, and deletes processed messages. Failed messages route to a Dead Letter Queue. |
+| **We simulate it with** | A generator that produces order event JSON messages and publishes them to the MSK Kafka `order.events` topic, mirroring what Lambda would do after consuming from SQS. Failed messages route to a Dead Letter Queue. |
 | **It simulates** | The order event bus that decouples the application from its downstream consumers. |
-| **How it works** | Lambda polls SQS every 20 seconds, batches up to 10 messages per invocation, writes them as JSON to S3 Raw, then deletes successfully processed messages from the queue. |
+| **How it works** | Lambda polls SQS every 20 seconds, batches up to 10 messages per invocation, and forwards them to the MSK Kafka `order.events` topic. Spark Structured Streaming consumes the topic and writes micro-batches to S3 Raw. |
 | **Dirty data** | Duplicate messages from SQS at-least-once delivery, malformed JSON from application bugs, missing order amounts, cancelled orders arriving after shipped status. |
 | **Bronze table** | `bronze.order_events` |
 
@@ -448,7 +448,7 @@ bash demo/start_demo.sh
 |---|---|
 | **Type** | Email event stream |
 | **In the real world** | SES fires a notification to SNS for every email event. SNS triggers Lambda, which formats the event as JSON and writes to S3 Raw. Airflow ingests S3 Raw to Bronze on an hourly schedule. |
-| **We simulate it with** | A generator that produces realistic SES email event JSON — with realistic open rates (~40%), click rates (~15%), bounce rates (~2%), and complaint rates (~0.1%) — written to S3 Raw in the same structure Lambda would produce. |
+| **We simulate it with** | A generator that produces realistic SES email event JSON — with realistic open rates (~25%), click rates (~10%), bounce rates (~4%), and complaint rates (~1%) — written to S3 Raw in the same structure Lambda would produce. |
 | **It simulates** | The email engagement pipeline that CRM teams use to manage deliverability and that data teams join with purchase data to measure the revenue impact of email campaigns. |
 | **How it works** | SES fires events to SNS. SNS triggers Lambda. Lambda formats and writes JSON to S3 Raw. Airflow ingests hourly to Bronze partitioned by event type and date. |
 | **Dirty data** | Duplicate events from SNS at-least-once delivery, bounces without bounce reason codes, clicks with malformed URLs, complaint events missing recipient addresses. |
