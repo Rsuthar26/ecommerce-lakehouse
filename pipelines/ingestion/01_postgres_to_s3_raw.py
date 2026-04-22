@@ -130,7 +130,6 @@ def get_pg_conn():
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"],
         connect_timeout=10,
-        sslmode="require",
     )
 
 
@@ -187,18 +186,29 @@ def extract_table(conn, table_name: str, incremental_col: str,
     else:
         high_watermark = str(high_watermark)
 
-    log.info(f"  ✓ {len(df):,} rows | new watermark: {high_watermark}")
-    return df, high_watermark
+    # Data date range for filename — project naming convention
+    low_ts     = df[incremental_col].min()
+    high_ts    = df[incremental_col].max()
+    data_start = low_ts.strftime("%Y%m%d")  if hasattr(low_ts,  "strftime") else str(low_ts)[:10].replace("-","")
+    data_end   = high_ts.strftime("%Y%m%d") if hasattr(high_ts, "strftime") else str(high_ts)[:10].replace("-","")
+
+    log.info(f"  ✓ {len(df):,} rows | data: {data_start} → {data_end} | watermark: {high_watermark}")
+    return df, high_watermark, data_start, data_end
 
 
 # ─────────────────────────────────────────────────────────────
 # S3 WRITE
 # ─────────────────────────────────────────────────────────────
 
-def build_s3_key(table_name: str, run_ts: datetime) -> str:
+def build_s3_key(table_name: str, run_ts: datetime,
+                 data_start: str, data_end: str) -> str:
     """
-    Hive-style partition key for this file.
-    Partitioned by ingestion date — when the data arrived, not when it happened.
+    Hive-style partition key.
+    Folder: partitioned by ingestion date (when data arrived).
+    Filename: {table}_{data_start}_to_{data_end}.parquet (project naming rule).
+
+    This separates ingestion date (folder) from data date (filename),
+    so you can tell at a glance what time range each file covers.
     """
     return (
         f"{SOURCE_PREFIX}/"
@@ -206,7 +216,7 @@ def build_s3_key(table_name: str, run_ts: datetime) -> str:
         f"month={run_ts.strftime('%m')}/"
         f"day={run_ts.strftime('%d')}/"
         f"table={table_name}/"
-        f"{run_ts.strftime('%Y%m%d_%H%M%S')}.parquet"
+        f"{table_name}_{data_start}_to_{data_end}.parquet"
     )
 
 
@@ -271,11 +281,16 @@ def run(tables_to_run: dict, full_load: bool = False, dry_run: bool = False):
 
             last_wm = None if full_load else watermarks.get(table_name)
 
-            df, high_wm = extract_table(
+            result = extract_table(
                 pg_conn, table_name,
                 config["incremental_col"],
                 last_wm
             )
+            if len(result) == 2:
+                df, high_wm = result
+                data_start = data_end = "unknown"
+            else:
+                df, high_wm, data_start, data_end = result
 
             if df.empty:
                 stats["skipped"] += 1
@@ -286,12 +301,13 @@ def run(tables_to_run: dict, full_load: bool = False, dry_run: bool = False):
             log.info(f"  Parquet: {size_kb:.1f} KB")
 
             if dry_run:
-                log.info(f"  [DRY RUN] Would write: {build_s3_key(table_name, run_ts)}")
+                key = build_s3_key(table_name, run_ts, data_start, data_end)
+                log.info(f"  [DRY RUN] Would write: {key}")
                 log.info(f"  [DRY RUN] Would update watermark to: {high_wm}")
                 continue
 
             # Write to S3
-            key = build_s3_key(table_name, run_ts)
+            key = build_s3_key(table_name, run_ts, data_start, data_end)
             uri = write_to_s3(s3_client, RAW_BUCKET, key, parquet_bytes, run_ts, high_wm)
             log.info(f"  Written: {uri}")
 
