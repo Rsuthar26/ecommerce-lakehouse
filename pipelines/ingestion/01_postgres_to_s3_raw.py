@@ -1,5 +1,5 @@
 """
-pipelines/ingestion/01_postgres_to_s3_raw.py — Staff DE Journey
+pipelines/ingestion/01_postgres_to_s3_raw.py
 
 Production-grade incremental ingestion from RDS PostgreSQL → S3 Raw.
 
