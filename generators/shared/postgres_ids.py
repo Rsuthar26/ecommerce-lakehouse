@@ -106,7 +106,7 @@ def load_entity_ids(limit: int = 1000) -> dict:
 
     # Product SKUs from order_items (only SKUs that have actually been ordered)
     cur.execute("""
-        SELECT DISTINCT product_sku FROM order_items
+        SELECT product_sku FROM order_items
         ORDER BY RANDOM()
         LIMIT %s
     """, (limit,))

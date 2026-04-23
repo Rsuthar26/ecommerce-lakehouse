@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import random
+import hashlib
 import logging
 import argparse
 import json
@@ -292,7 +293,8 @@ def build_order(customer_id, placed_at, dirty):
                   str(random.randint(1000,9999)) if method=="card" else None,
                   random.choice(CARD_BRANDS)     if method=="card" else None,
                   fc, fm, placed + timedelta(minutes=random.randint(1,10)),
-                  placed, placed),
+                  placed, placed,
+                  f"pi_{hashlib.md5(f'order_{customer_id}_{placed.date()}'.encode()).hexdigest()[:24]}"),
     }
 
 
@@ -366,16 +368,23 @@ def run_burst(conn, days=7, dirty=False):
                     VALUES %s
                 """, item_rows)
 
-            pay_rows = [(oid,) + pay for oid, pay in zip(oids, bp)]
+            # Rebuild PI ID using real order_id (not customer_id)
+            # Formula must match generators/06_stripe/generate.py exactly
+            pay_rows = []
+            for oid, pay, order_tuple in zip(oids, bp, bo):
+                placed_at = order_tuple[10]  # index 10 = placed_at
+                pi_id = f"pi_{hashlib.md5(f'order_{oid}_{placed_at.date()}'.encode()).hexdigest()[:24]}"
+                pay_rows.append((oid,) + pay[:-1] + (pi_id,))
             psycopg2.extras.execute_values(cur, """
                 INSERT INTO payments
                     (order_id, amount_pence, currency, payment_status,
                      payment_method, card_last4, card_brand,
                      failure_code, failure_message,
-                     processed_at, created_at, updated_at)
+                     processed_at, created_at, updated_at,
+                     stripe_payment_intent_id)
                 VALUES %s
             """, pay_rows,
-            template="(%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+            template="(%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
 
             flush_q(cur, conn)
             conn.commit()
@@ -499,9 +508,12 @@ def run_stream(conn, dirty=False):
                             (order_id,amount_pence,currency,payment_status,
                              payment_method,card_last4,card_brand,
                              failure_code,failure_message,
-                             processed_at,created_at,updated_at)
-                        VALUES (%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, (oid,) + data["pay"])
+                             processed_at,created_at,updated_at,
+                             stripe_payment_intent_id)
+                        VALUES (%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (oid,) + data["pay"][:-1] + (
+                        f"pi_{hashlib.md5(f'order_{oid}_{now.date()}'.encode()).hexdigest()[:24]}",
+                    ))
                     stats["orders"] += 1
                     flush_q(cur, conn); conn.commit()
 

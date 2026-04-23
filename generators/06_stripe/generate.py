@@ -44,7 +44,7 @@ from faker import Faker
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from generators.shared.postgres_ids import load_entity_ids
+from generators.shared.postgres_ids import load_entity_ids, get_pg_connection
 
 load_dotenv()
 
@@ -69,13 +69,48 @@ DISPUTE_REASONS = [
     "product_unacceptable", "subscription_canceled"
 ]
 
-_entity_ids = None
+_entity_ids    = None
+_payment_rows  = None   # list of (order_id, stripe_payment_intent_id, amount_pence)
 
 def get_entity_ids():
     global _entity_ids
     if _entity_ids is None:
         _entity_ids = load_entity_ids()
     return _entity_ids
+
+def get_payment_rows() -> list:
+    """
+    Load real (order_id, stripe_payment_intent_id, amount_pence) from Postgres.
+    This is the ONLY correct way to generate Stripe charges that join back to
+    payments — regenerating the PI ID formula produces different dates for
+    backdated records and breaks the Silver join entirely.
+    """
+    global _payment_rows
+    if _payment_rows is not None:
+        return _payment_rows
+    try:
+        conn = get_pg_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT order_id, stripe_payment_intent_id, amount_pence
+            FROM payments
+            WHERE stripe_payment_intent_id IS NOT NULL
+            ORDER BY RANDOM()
+            LIMIT 2000
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        _payment_rows = rows
+        log.info(f"Loaded {len(rows)} real payment records from Postgres")
+    except Exception as e:
+        log.warning(f"Could not load payments from Postgres ({e}) — falling back to entity_ids")
+        ids = get_entity_ids()
+        _payment_rows = [
+            (oid, f"pi_{hashlib.md5(f'order_{oid}_fallback'.encode()).hexdigest()[:24]}", 0)
+            for oid in ids["order_ids"]
+        ]
+    return _payment_rows
 
 
 # ─────────────────────────────────────────────────────────────
@@ -118,13 +153,15 @@ def dirty_amount(amount, dirty):
 
 def build_stripe_charge(created_at: datetime, dirty: bool = False) -> dict:
     ids           = get_entity_ids()
-    order_id      = random.choice(ids["order_ids"]) if ids["order_ids"] else None
-    amount_pence  = dirty_amount(random.randint(999, 99999), dirty)
+    payment_rows  = get_payment_rows()
+
+    # Rule 11 + join fix: use real order_id + PI ID from Postgres payments table
+    # Never regenerate PI ID from a formula — dates differ for backdated records
+    order_id, pi_id, pg_amount = random.choice(payment_rows)
+    # Use Postgres amount as base, apply dirty mutation if needed
+    amount_pence  = dirty_amount(pg_amount if pg_amount > 0 else random.randint(999, 99999), dirty)
     status        = charge_status_for_age(created_at)
     method        = random.choice(PAYMENT_METHODS)
-
-    # Stripe payment intent ID — stable for Rule 5
-    pi_id = f"pi_{hashlib.md5(f'order_{order_id}_{created_at.date()}'.encode()).hexdigest()[:24]}"
 
     charge = {
         "object":        "charge",
@@ -235,7 +272,7 @@ def write_batch(charges: list, output_dir: Path, batch_num: int, ts: datetime):
 
 def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    get_entity_ids()
+    get_payment_rows()  # Rule 11: load real PI IDs from Postgres at startup
     t0     = time.time()
     stats  = {"charges": 0, "batches": 0}
     now    = datetime.now(timezone.utc)
@@ -272,7 +309,7 @@ def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
 
 def run_stream(output_dir: Path, dirty: bool = False):
     log.info(f"STREAM MODE | ~10K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids()
+    get_payment_rows()  # Rule 11: load real PI IDs from Postgres at startup
     stats, i = {"charges": 0}, 0
     try:
         while True:
