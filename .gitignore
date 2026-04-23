@@ -16,3 +16,6 @@ generators/.DS_Store
 .DS_Store
 .env
 **/.DS_Store
+__pycache__/
+*.db
+*.pyc

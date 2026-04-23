@@ -97,7 +97,7 @@ def run_burst(output_dir, days=7, dirty=False):
     t0, stats, now = time.time(), {"products":0,"discounts":0}, datetime.now(timezone.utc)
     for day_offset in range(days):
         base_dt = now - timedelta(days=day_offset)
-        products = [build_product(sku, base_dt, dirty) for sku in random.sample(PRODUCT_SKUS, 50)]
+        products = [build_product(sku, base_dt, dirty) for sku in random.sample(get_entity_ids()["product_skus"], min(50, len(get_entity_ids()["product_skus"])))]
         write_batch(products, output_dir, day_offset, base_dt)
         stats["products"] += len(products)
         discounts = [build_discount(base_dt, dirty) for _ in range(10)]
@@ -113,7 +113,7 @@ def run_stream(output_dir, dirty=False):
     try:
         while True:
             i += 1; now = datetime.now(timezone.utc)
-            sku = random.choice(PRODUCT_SKUS)
+            sku = random.choice(get_entity_ids()["product_skus"])
             write_batch([build_product(sku, now, dirty)], output_dir, i, now)
             stats["sent"] += 1
             if i % 50 == 0: log.info(f"Stream — {stats}")
