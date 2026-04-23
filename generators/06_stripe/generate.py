@@ -69,8 +69,8 @@ DISPUTE_REASONS = [
     "product_unacceptable", "subscription_canceled"
 ]
 
-_entity_ids    = None
-_payment_rows  = None   # list of (order_id, stripe_payment_intent_id, amount_pence)
+_entity_ids   = None
+_payment_rows = None  # list of (order_id, stripe_payment_intent_id, amount_pence)
 
 def get_entity_ids():
     global _entity_ids
@@ -81,7 +81,7 @@ def get_entity_ids():
 def get_payment_rows() -> list:
     """
     Load real (order_id, stripe_payment_intent_id, amount_pence) from Postgres.
-    This is the ONLY correct way to generate Stripe charges that join back to
+    This is the only correct way to generate Stripe charges that join back to
     payments — regenerating the PI ID formula produces different dates for
     backdated records and breaks the Silver join entirely.
     """
@@ -104,7 +104,7 @@ def get_payment_rows() -> list:
         _payment_rows = rows
         log.info(f"Loaded {len(rows)} real payment records from Postgres")
     except Exception as e:
-        log.warning(f"Could not load payments from Postgres ({e}) — falling back to entity_ids")
+        log.warning(f"Could not load payments from Postgres ({e}) — using fallback")
         ids = get_entity_ids()
         _payment_rows = [
             (oid, f"pi_{hashlib.md5(f'order_{oid}_fallback'.encode()).hexdigest()[:24]}", 0)
@@ -152,16 +152,15 @@ def dirty_amount(amount, dirty):
 # ─────────────────────────────────────────────────────────────
 
 def build_stripe_charge(created_at: datetime, dirty: bool = False) -> dict:
-    ids           = get_entity_ids()
-    payment_rows  = get_payment_rows()
+    ids          = get_entity_ids()
+    payment_rows = get_payment_rows()
 
     # Rule 11 + join fix: use real order_id + PI ID from Postgres payments table
     # Never regenerate PI ID from a formula — dates differ for backdated records
     order_id, pi_id, pg_amount = random.choice(payment_rows)
-    # Use Postgres amount as base, apply dirty mutation if needed
-    amount_pence  = dirty_amount(pg_amount if pg_amount > 0 else random.randint(999, 99999), dirty)
-    status        = charge_status_for_age(created_at)
-    method        = random.choice(PAYMENT_METHODS)
+    amount_pence = dirty_amount(pg_amount if pg_amount > 0 else random.randint(999, 99999), dirty)
+    status       = charge_status_for_age(created_at)
+    method       = random.choice(PAYMENT_METHODS)
 
     charge = {
         "object":        "charge",
@@ -252,18 +251,30 @@ def build_stripe_charge(created_at: datetime, dirty: bool = False) -> dict:
 # OUTPUT
 # ─────────────────────────────────────────────────────────────
 
-def write_batch(charges: list, output_dir: Path, batch_num: int, ts: datetime):
-    date_path = output_dir / ts.strftime("%Y/%m/%d/%H")
+def write_hour_file(charges: list, output_dir: Path, hour_dt: datetime) -> None:
+    """
+    Write all charges for a single hour to one file.
+    Folder: output_dir/YYYY/MM/DD/HH/
+    Filename: stripe_charges_YYYYMMDD_HH00_to_YYYYMMDD_HH59.json
+    Hour folder contains ONLY charges from that hour — S3 partitioning is meaningful.
+    """
+    date_path = output_dir / hour_dt.strftime("%Y/%m/%d/%H")
     date_path.mkdir(parents=True, exist_ok=True)
-    file_path = date_path / f"stripe_charges_{batch_num:04d}.json"
+    fname = (
+        f"stripe_charges_"
+        f"{hour_dt.strftime('%Y%m%d_%H')}00_to_"
+        f"{hour_dt.strftime('%Y%m%d_%H')}59.json"
+    )
+    file_path = date_path / fname
     with open(file_path, "w") as f:
         json.dump({
-            "batch":      batch_num,
+            "hour":       hour_dt.strftime("%Y-%m-%d %H:00 UTC"),
             "count":      len(charges),
             "source":     "stripe",
-            "fetched_at": ts.isoformat(),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
             "charges":    charges,
         }, f, default=str)
+    log.info(f"  Written: {fname} ({len(charges)} charges)")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -272,31 +283,33 @@ def write_batch(charges: list, output_dir: Path, batch_num: int, ts: datetime):
 
 def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    get_payment_rows()  # Rule 11: load real PI IDs from Postgres at startup
-    t0     = time.time()
-    stats  = {"charges": 0, "batches": 0}
-    now    = datetime.now(timezone.utc)
-    total  = days * 1500   # ~10K/day, sample for burst speed
-    batch_size = 100
-    buffer, batch_num = [], 0
+    get_payment_rows()
+    t0    = time.time()
+    stats = {"charges": 0, "files": 0}
+    now   = datetime.now(timezone.utc)
+    total = days * 1500   # ~10K/day, sample for burst speed
+
+    # Collect all charges grouped by hour bucket
+    # Key: datetime truncated to hour — guarantees one file per hour
+    hour_buckets: dict = {}
 
     for _ in range(total):
         days_ago   = random.uniform(0, days)
         base_dt    = now - timedelta(days=days_ago)
         created_at = payment_timestamp(base_dt)
         charge     = build_stripe_charge(created_at, dirty)
-        buffer.append(charge)
+
+        # Truncate to hour — this is the bucket key and folder name
+        hour_key = created_at.replace(minute=0, second=0, microsecond=0)
+        if hour_key not in hour_buckets:
+            hour_buckets[hour_key] = []
+        hour_buckets[hour_key].append(charge)
         stats["charges"] += 1
 
-        if len(buffer) >= batch_size:
-            write_batch(buffer, output_dir, batch_num, created_at)
-            stats["batches"] += 1
-            batch_num += 1
-            buffer = []
-
-    if buffer:
-        write_batch(buffer, output_dir, batch_num, datetime.now(timezone.utc))
-        stats["batches"] += 1
+    # Write one file per hour — each file contains ONLY that hour's charges
+    for hour_dt, charges in sorted(hour_buckets.items()):
+        write_hour_file(charges, output_dir, hour_dt)
+        stats["files"] += 1
 
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
@@ -309,14 +322,15 @@ def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
 
 def run_stream(output_dir: Path, dirty: bool = False):
     log.info(f"STREAM MODE | ~10K/day | dirty={dirty} | Ctrl+C to stop")
-    get_payment_rows()  # Rule 11: load real PI IDs from Postgres at startup
+    get_payment_rows()
     stats, i = {"charges": 0}, 0
     try:
         while True:
             i     += 1
             now    = datetime.now(timezone.utc)
             charge = build_stripe_charge(now, dirty)
-            write_batch([charge], output_dir, i, now)
+            # Stream: one charge per file in the current hour folder
+            write_hour_file([charge], output_dir, now.replace(minute=0, second=0, microsecond=0))
             stats["charges"] += 1
             if i % 100 == 0:
                 log.info(f"Stream — {stats}")

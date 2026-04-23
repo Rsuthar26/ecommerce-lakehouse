@@ -117,10 +117,11 @@ def build_s3_key(local_path: Path, input_dir: Path,
         new_name = f"stripe_{data_start}_to_{data_end}_{stem}.json"
 
         hour = parts[3] if len(parts) > 4 else "00"
+        # Filename already contains correct time range — use as-is
         return (
             f"{SOURCE_PREFIX}/"
             f"year={year}/month={month}/day={day}/hour={hour}/"
-            f"{new_name}"
+            f"{local_path.name}"
         )
     except Exception:
         # Fallback
