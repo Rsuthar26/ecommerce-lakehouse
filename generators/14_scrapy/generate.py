@@ -19,9 +19,45 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from generators.shared.postgres_ids import load_entity_ids
 
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 fake = Faker("en_GB"); Faker.seed(42)
+
+# ─────────────────────────────────────────────────────────────
+# MONGODB PRICE CACHE — our retail price per SKU
+# our_price_pence is our retail price — must match MongoDB catalog,
+# same as Source 08 Shopify. Competitor price is independent.
+# ─────────────────────────────────────────────────────────────
+
+_mongo_prices: dict = {}
+
+def load_mongo_prices() -> dict:
+    global _mongo_prices
+    if _mongo_prices:
+        return _mongo_prices
+    try:
+        from pymongo import MongoClient
+        mongo_uri = os.environ.get(
+            "MONGO_URI",
+            "mongodb+srv://mongo_admin:MongoAdmin2026!@ecommerce-cluster.k2gc71w.mongodb.net/"
+        )
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        cursor = client["ecommerce"]["products"].find(
+            {"base_price_pence": {"$exists": True, "$gt": 0}},
+            {"product_sku": 1, "base_price_pence": 1, "_id": 0}
+        )
+        _mongo_prices = {
+            doc["product_sku"]: doc["base_price_pence"]
+            for doc in cursor
+            if doc.get("product_sku") and doc.get("base_price_pence")
+        }
+        client.close()
+        log.info(f"Loaded {len(_mongo_prices)} product prices from MongoDB")
+    except Exception as e:
+        log.warning(f"MongoDB unavailable ({e}) — our_price_pence will use random fallback")
+        _mongo_prices = {}
+    return _mongo_prices
 
 STREAM_SLEEP = 86400 / 2000
 
@@ -71,7 +107,7 @@ def build_price_record(scraped_at: datetime, dirty: bool = False) -> dict:
     ids         = get_entity_ids()
     sku         = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
     competitor  = random.choice(COMPETITORS)
-    our_price   = random.randint(499, 29999)
+    our_price   = load_mongo_prices().get(sku, random.randint(499, 29999))
     # Competitor prices 5-25% above or below ours
     comp_price  = int(our_price * random.uniform(0.75, 1.25))
     availability = availability_for_age(scraped_at)
@@ -130,7 +166,7 @@ def write_daily_file(records, output_dir, day_dt):
     log.info(f"  Written: {fname} ({len(records)} records)")
 
 def run_burst(output_dir, days=7, dirty=False):
-    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
+    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids(); load_mongo_prices()
     t0, stats, now = time.time(), {"records": 0, "files": 0}, datetime.now(timezone.utc)
     total = days * 300
 
@@ -152,7 +188,7 @@ def run_burst(output_dir, days=7, dirty=False):
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~2K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"records": 0}, 0
+    get_entity_ids(); load_mongo_prices(); stats, i = {"records": 0}, 0
     try:
         while True:
             i += 1; now = datetime.now(timezone.utc)

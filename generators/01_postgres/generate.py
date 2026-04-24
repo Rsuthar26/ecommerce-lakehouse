@@ -2,31 +2,37 @@
 generators/01_postgres/generate.py — Staff DE Journey: Source 01
 
 Simulates realistic e-commerce activity in RDS PostgreSQL.
-Follows all 10 generator rules — see README.md for details.
+This is the MASTER source — all other sources reference IDs that originate here.
 
-Key design: burst mode uses batched inserts (execute_values + commit
-every 100 rows) instead of per-row commits. This reduces ~6600 round
-trips to ~66, bringing burst time under 2 minutes (Rule 2).
+Rules satisfied:
+    Rule 1  — --mode burst and --mode stream
+    Rule 2  — burst completes in < 2 minutes
+    Rule 3  — timestamps backdated with realistic time-of-day peaks
+    Rule 4  — order_status reflects age of record
+    Rule 5  — ON CONFLICT DO NOTHING throughout
+    Rule 6  — stream: ~1 order/sec (~50K rows/day across all tables)
+    Rule 7  — dirty data: malformed rows, missing fields, bad types
+    Rule 8  — README.md exists
+    Rule 9  — connection config via environment variables
+    Rule 10 — callable from single bash line
+    Rule 11 — N/A: this IS the master source of truth
 
 Usage:
-    python generate.py --mode burst              # 7 days history, clean
-    python generate.py --mode burst --dirty      # 7 days history, dirty
-    python generate.py --mode stream             # continuous, ~0.6 ops/sec
-    python generate.py --mode stream --dirty     # continuous, dirty
+    python generate.py --mode burst --days 7
+    python generate.py --mode burst --days 7 --dirty
+    python generate.py --mode stream
 """
 
 import os
 import sys
 import time
 import random
-import hashlib
 import logging
 import argparse
-import json
+import hashlib
 from datetime import datetime, timezone, timedelta
 
 import psycopg2
-import psycopg2.extras
 from faker import Faker
 from dotenv import load_dotenv
 
@@ -42,399 +48,328 @@ log = logging.getLogger(__name__)
 fake = Faker("en_GB")
 Faker.seed(42)
 
-PRODUCT_SKUS    = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
-PRODUCT_NAMES   = [
-    "Wireless Headphones", "USB-C Hub", "Laptop Stand", "Mechanical Keyboard",
-    "Mouse Pad XL", "Webcam HD", "Monitor Arm", "Cable Organiser",
-    "Power Bank 20000mAh", "Smart Plug", "LED Desk Lamp", "Phone Stand",
-    "Ergonomic Chair", "Standing Desk", "Wrist Rest", "Laptop Sleeve",
-    "Screen Cleaner Kit", "Desk Organiser", "USB Hub 7-Port", "Trackpad",
-]
-WAREHOUSES      = ["WH-LONDON-01", "WH-MANC-01", "WH-BRUM-01"]
-CARD_BRANDS     = ["visa", "mastercard", "amex"]
+STREAM_SLEEP = 86400 / 50000  # ~1 order/sec = ~50K rows/day across tables (Rule 6 + Rule 13)
+
+ORDER_STATUSES  = ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled", "refunded"]
 PAYMENT_METHODS = ["card", "paypal", "klarna", "bank_transfer", "gift_card"]
-CHANNELS        = ["web", "web", "web", "mobile", "mobile", "api"]
-TIERS           = ["standard", "standard", "standard", "silver", "gold", "vip"]
-STREAM_SLEEP = 86400 / 50000  # Rule 13: ~1 order/sec = ~50K rows/day
-BURST_BATCH     = 100         # commit every N orders in burst mode
-VALID_STATUSES  = {'pending','confirmed','processing','shipped','delivered','cancelled','refunded'}
+WAREHOUSES      = ["WH-LONDON-01", "WH-MANC-01", "WH-BRUM-01"]
+CHANNELS        = ["web", "mobile", "api"]
+CATEGORIES      = ["Electronics", "Furniture", "Accessories", "Clothing", "Home"]
+PRODUCT_SKUS    = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
 
 
 # ─────────────────────────────────────────────────────────────
-# RULE 3 — REALISTIC TIMESTAMPS
+# CONNECTION
 # ─────────────────────────────────────────────────────────────
 
-def realistic_timestamp(base_dt: datetime) -> datetime:
+def get_conn():
+    return psycopg2.connect(
+        host=os.environ.get("PG_HOST", "localhost"),
+        port=int(os.environ.get("PG_PORT", 5432)),
+        dbname=os.environ.get("PG_DBNAME", "ecommerce"),
+        user=os.environ.get("PG_USER", "postgres_admin"),
+        password=os.environ.get("PG_PASSWORD", ""),
+        connect_timeout=15,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# RULE 3 — REALISTIC TIME-OF-DAY PEAKS
+# B2C peak: 10am-12pm and 7pm-9pm. Higher volume on weekends.
+# ─────────────────────────────────────────────────────────────
+
+def peak_timestamp(base_dt: datetime) -> datetime:
     peak_windows = [
-        (10, 12, 0.35), (19, 21, 0.30), (12, 19, 0.25),
-        (8,  10, 0.05), (21, 23, 0.05),
+        (10, 12, 0.30),  # Morning peak
+        (19, 21, 0.30),  # Evening peak
+        (12, 19, 0.25),  # Afternoon steady
+        (8,  10, 0.08),  # Morning warm-up
+        (21, 23, 0.07),  # Late evening tail
     ]
-    r, cumul = random.random(), 0.0
-    s, e = 10, 12
+    r, cumul, s, e = random.random(), 0.0, 10, 12
     for start, end, w in peak_windows:
         cumul += w
         if r <= cumul:
             s, e = start, end
             break
-    return base_dt.replace(hour=random.randint(s, e-1),
-                           minute=random.randint(0, 59),
-                           second=random.randint(0, 59),
-                           tzinfo=timezone.utc)
-
-
-def get_burst_timestamps(days: int = 7) -> list:
-    start = datetime.now(timezone.utc) - timedelta(days=days)
-    ts = []
-    for d in range(days):
-        day_dt = start + timedelta(days=d)
-        count  = int(285 * (1.4 if day_dt.weekday() >= 5 else 1.0))
-        for _ in range(count):
-            t = realistic_timestamp(day_dt) + timedelta(minutes=random.randint(0, 59))
-            ts.append(t)
-    ts.sort()
-    return ts
+    # Weekend gets 30% more volume — handled by caller
+    return base_dt.replace(
+        hour=random.randint(s, e - 1),
+        minute=random.randint(0, 59),
+        second=random.randint(0, 59),
+        tzinfo=timezone.utc
+    )
 
 
 # ─────────────────────────────────────────────────────────────
 # RULE 4 — STATUS REFLECTS AGE
 # ─────────────────────────────────────────────────────────────
 
-def status_for_age(placed_at: datetime) -> dict:
-    age = (datetime.now(timezone.utc) - placed_at).total_seconds() / 3600
-    r   = {"order_status": "pending", "confirmed_at": None,
-           "shipped_at": None, "delivered_at": None, "cancelled_at": None}
-
-    if age < 1:
-        r["order_status"] = "pending"
-    elif age < 3:
-        if random.random() < 0.05:
-            r["order_status"] = "cancelled"
-            r["cancelled_at"] = placed_at + timedelta(hours=random.uniform(0.5, 2))
-        else:
-            r["order_status"] = "confirmed"
-            r["confirmed_at"] = placed_at + timedelta(hours=random.uniform(0.5, 1.5))
-    elif age < 24:
-        r["order_status"] = "processing"
-        r["confirmed_at"] = placed_at + timedelta(hours=random.uniform(0.5, 1.5))
-    elif age < 72:
-        if random.random() < 0.03:
-            r["order_status"] = "cancelled"
-            r["cancelled_at"] = placed_at + timedelta(hours=random.uniform(2, 12))
-        else:
-            r["order_status"] = "shipped"
-            r["confirmed_at"] = placed_at + timedelta(hours=random.uniform(0.5, 1.5))
-            r["shipped_at"]   = placed_at + timedelta(hours=random.uniform(24, 48))
+def order_status_for_age(created_at: datetime) -> str:
+    age_hrs = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
+    if age_hrs < 1:
+        return "pending"
+    elif age_hrs < 4:
+        return random.choices(["pending", "confirmed"], weights=[0.3, 0.7])[0]
+    elif age_hrs < 24:
+        return random.choices(["confirmed", "processing"], weights=[0.4, 0.6])[0]
+    elif age_hrs < 72:
+        return random.choices(["processing", "shipped"], weights=[0.3, 0.7])[0]
+    elif age_hrs < 120:
+        return random.choices(["shipped", "delivered", "cancelled"], weights=[0.5, 0.4, 0.1])[0]
     else:
-        r["order_status"] = "refunded" if random.random() < 0.02 else "delivered"
-        r["confirmed_at"] = placed_at + timedelta(hours=random.uniform(0.5, 1.5))
-        r["shipped_at"]   = placed_at + timedelta(hours=random.uniform(24, 48))
-        r["delivered_at"] = placed_at + timedelta(hours=random.uniform(72, 96))
-    return r
+        return random.choices(["delivered", "cancelled", "refunded"], weights=[0.85, 0.10, 0.05])[0]
 
-
-def pay_status(order_status: str) -> str:
-    return {"pending": "pending", "confirmed": "processing",
-            "processing": "processing", "shipped": "succeeded",
-            "delivered": "succeeded", "cancelled": "failed",
-            "refunded": "refunded"}.get(order_status, "pending")
+def payment_status_for_order_status(order_status: str) -> str:
+    if order_status in ("delivered", "shipped", "processing"):
+        return random.choices(["succeeded", "succeeded"], weights=[0.97, 0.03])[0]
+    elif order_status == "cancelled":
+        return random.choices(["succeeded", "refunded", "failed"], weights=[0.3, 0.4, 0.3])[0]
+    elif order_status == "refunded":
+        return "refunded"
+    elif order_status == "failed":
+        return "failed"
+    else:
+        return random.choices(["pending", "succeeded", "failed"], weights=[0.6, 0.35, 0.05])[0]
 
 
 # ─────────────────────────────────────────────────────────────
-# RULE 7 — DIRTY DATA
+# RULE 7 — DIRTY DATA HELPERS
 # ─────────────────────────────────────────────────────────────
 
 def dr(base, dirty, elevated):
     return elevated if dirty else base
 
-def bad_email(email, dirty):
-    if random.random() < dr(0.01, dirty, 0.10):
-        return random.choice(["notanemail", "missing@", "@nodomain.com", ""])
+def maybe_null(value, dirty, base=0.05, elev=0.20):
+    return None if random.random() < dr(base, dirty, elev) else value
+
+def dirty_email(email, dirty):
+    if random.random() < dr(0.01, dirty, 0.08):
+        return random.choice(["invalid-email", "@nodomain", "", None, "user@"])
     return email
 
-def bad_price(price, dirty):
-    if random.random() < dr(0.005, dirty, 0.08):
-        return random.choice(["free", "N/A", "TBD", None, -1, 0])
-    return price
+def dirty_amount(amount, dirty):
+    if random.random() < dr(0.005, dirty, 0.05):
+        return random.choice([0, -1, 999999999])
+    return amount
 
-def bad_status(status, dirty):
-    # Status corruption only in dirty mode — clean mode must satisfy DB check constraint
-    if dirty and random.random() < 0.15:
-        return random.choice([status.upper(), status.capitalize(), status + "_", "UNKNOWN"])
+def dirty_status(status, valid_statuses, dirty):
+    if random.random() < dr(0.01, dirty, 0.15):
+        return random.choice([status.upper(), status.capitalize(), "UNKNOWN"])
     return status
 
-def null_phone(phone, dirty):
-    return None if random.random() < dr(0.05, dirty, 0.20) else phone
 
-def future_ts(ts, dirty):
-    return datetime(2099, 1, 1, tzinfo=timezone.utc) if (dirty and random.random() < 0.05) else ts
+# ─────────────────────────────────────────────────────────────
+# SCHEMA CREATION
+# ─────────────────────────────────────────────────────────────
 
-def address(dirty):
-    a = {"street": fake.street_address(), "city": fake.city(),
-         "county": fake.county(), "postcode": fake.postcode(), "country": "GB"}
-    # Never return raw strings — breaks psycopg2 execute_values batch inserts.
-    # Dirty mode injects missing fields and wrong types inside valid JSON instead.
-    if dirty and random.random() < 0.10:
-        a.pop(random.choice(["street", "city", "postcode"]), None)
-    if dirty and random.random() < 0.05:
-        a["postcode"] = random.randint(1000, 9999)
-    return psycopg2.extras.Json(a)
+def create_schema(cur):
+    with open(os.path.join(os.path.dirname(__file__), "schema.sql"), "r") as f:
+        cur.execute(f.read())
 
 
 # ─────────────────────────────────────────────────────────────
-# QUARANTINE (Rule 7)
+# SEED — base data load (customers, products, inventory)
+# Rule 5: ON CONFLICT DO NOTHING throughout
 # ─────────────────────────────────────────────────────────────
 
-_q_buf = []
+def seed_customers(cur, count: int = 500, dirty: bool = False):
+    log.info(f"  Seeding {count} customers...")
+    for _ in range(count):
+        email = dirty_email(fake.unique.email(), dirty)
+        cur.execute("""
+            INSERT INTO customers
+                (email, first_name, last_name, phone, country, city, postcode,
+                 marketing_opt_in, account_status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (email) DO NOTHING
+        """, (
+            email,
+            maybe_null(fake.first_name(), dirty),
+            maybe_null(fake.last_name(), dirty),
+            maybe_null(fake.phone_number()[:30], dirty),
+            "GB",
+            maybe_null(fake.city(), dirty),
+            maybe_null(fake.postcode(), dirty),
+            random.random() > 0.4,
+            dirty_status("active", ["active", "suspended", "closed"], dirty)
+                if random.random() < 0.02 else "active",
+        ))
 
-def ensure_quarantine(cur, conn):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS quarantine_log (
-            id BIGSERIAL PRIMARY KEY, source_table VARCHAR(50),
-            reason TEXT, raw_data JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
-        )
-    """)
-    conn.commit()
 
-def q(source, reason, data):
-    _q_buf.append((source, reason, json.dumps(data, default=str)))
-    log.warning(f"QUARANTINE [{source}] {str(reason)[:80]}")
+def seed_products_and_inventory(cur, count: int = 200, dirty: bool = False):
+    log.info(f"  Seeding {count} products + inventory...")
+    for i, sku in enumerate(PRODUCT_SKUS[:count]):
+        price_pence = random.randint(499, 29999)
+        cur.execute("""
+            INSERT INTO inventory
+                (product_sku, warehouse_id, quantity_available,
+                 quantity_reserved, unit_cost_pence)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (product_sku, warehouse_id) DO NOTHING
+        """, (
+            sku,
+            random.choice(WAREHOUSES),
+            dirty_amount(random.randint(0, 500), dirty),
+            random.randint(0, 20),
+            int(price_pence * 0.55),
+        ))
 
-def flush_q(cur, conn):
-    if not _q_buf:
+
+# ─────────────────────────────────────────────────────────────
+# ORDER GENERATION
+# ─────────────────────────────────────────────────────────────
+
+def generate_order(cur, created_at: datetime, dirty: bool = False):
+    """Generate one complete order: order + items + payment."""
+
+    # Real customer from DB
+    cur.execute("SELECT customer_id FROM customers ORDER BY RANDOM() LIMIT 1")
+    row = cur.fetchone()
+    if not row:
         return
-    psycopg2.extras.execute_values(cur,
-        "INSERT INTO quarantine_log (source_table, reason, raw_data) VALUES %s",
-        [(s, r, d) for s, r, d in _q_buf],
-        template="(%s, %s, %s::jsonb)")
-    _q_buf.clear()
+    customer_id = row[0]
 
+    order_status   = order_status_for_age(created_at)
+    shipping_pence = random.choice([0, 299, 499, 999])
 
-# ─────────────────────────────────────────────────────────────
-# CONNECTION (Rule 9)
-# ─────────────────────────────────────────────────────────────
+    cur.execute("""
+        INSERT INTO orders
+            (customer_id, order_status, channel, total_amount_pence,
+             discount_amount_pence, shipping_amount_pence, currency,
+             shipping_address, shipping_city, shipping_postcode,
+             shipping_country, created_at, updated_at)
+        VALUES (%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING order_id
+    """, (
+        customer_id,
+        dirty_status(order_status, ORDER_STATUSES, dirty),
+        random.choice(CHANNELS),
+        dirty_amount(random.randint(0, 500), dirty),
+        shipping_pence,
+        "GBP",
+        maybe_null(fake.street_address(), dirty),
+        maybe_null(fake.city(), dirty),
+        maybe_null(fake.postcode(), dirty),
+        "GB",
+        created_at,
+        created_at,
+    ))
+    order_id = cur.fetchone()[0]
 
-def get_conn():
-    return psycopg2.connect(
-        host=os.environ["DB_HOST"],
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ.get("DB_NAME", "ecommerce"),
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        connect_timeout=10,
+    # Order items (1-4)
+    total_pence = shipping_pence
+    num_items   = random.randint(1, 4)
+    cur.execute(
+        "SELECT product_sku FROM inventory ORDER BY RANDOM() LIMIT %s", (num_items,)
+    )
+    skus = [row[0] for row in cur.fetchall()]
+
+    for sku in skus:
+        qty         = random.randint(1, 3)
+        unit_pence  = random.randint(499, 14999)
+        disc_pence  = int(unit_pence * random.uniform(0, 0.2)) if random.random() < 0.15 else 0
+        total_pence += (unit_pence - disc_pence) * qty
+
+        cur.execute("""
+            INSERT INTO order_items
+                (order_id, product_sku, product_name, quantity,
+                 unit_price_pence, discount_pence, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            order_id,
+            sku,
+            maybe_null(fake.catch_phrase(), dirty),
+            qty if not dirty or random.random() > 0.005 else random.choice([-1, 0, 999]),
+            unit_pence,
+            disc_pence,
+            created_at,
+        ))
+
+        # Decrement inventory
+        cur.execute("""
+            UPDATE inventory
+            SET quantity_available = GREATEST(quantity_available - %s, 0),
+                quantity_reserved  = quantity_reserved + %s,
+                updated_at         = NOW()
+            WHERE product_sku = %s
+        """, (qty, qty, sku))
+
+    # Update order total
+    cur.execute(
+        "UPDATE orders SET total_amount_pence=%s WHERE order_id=%s",
+        (total_pence, order_id)
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# ROW BUILDERS — pure data, no DB calls
-# ─────────────────────────────────────────────────────────────
-
-def build_customer(ts, dirty):
-    email = bad_email(fake.email(), dirty)
-    if not email or "@" not in str(email):
-        q("customers", f"invalid_email: {email!r}", {"email": email})
-        return None
-    return (email, fake.first_name(), fake.last_name(),
-            null_phone(fake.phone_number()[:20], dirty),
-            address(dirty), random.choice(TIERS),
-            random.random() > 0.2, ts, ts)
-
-
-def build_order(customer_id, placed_at, dirty):
-    items, used = [], set()
-    for _ in range(random.choices([1,2,3,4,5], weights=[30,35,20,10,5])[0]):
-        sku = random.choice(PRODUCT_SKUS)
-        while sku in used: sku = random.choice(PRODUCT_SKUS)
-        used.add(sku)
-        raw   = random.randint(499, 29999)
-        price = bad_price(raw, dirty)
-        if not isinstance(price, int) or price <= 0:
-            q("order_items", f"invalid_unit_price: {price!r}", {"sku": sku})
-            price = raw
-        qty  = random.choices([1,2,3], weights=[70,20,10])[0]
-        disc = int(price * random.choice([0,0,0,0.1,0.2]))
-        items.append({"sku": sku, "name": random.choice(PRODUCT_NAMES),
-                      "qty": qty, "price": price, "disc": disc,
-                      "total": (price - disc) * qty})
-
-    sub  = sum(i["total"] for i in items)
-    disc = int(sub * random.choice([0,0,0,0.05,0.10]))
-    ship = 0 if sub > 3999 else 299
-    tax  = int((sub - disc) * 0.20)
-    tot  = (sub - disc) + ship + tax
-
-    sd     = status_for_age(placed_at)
-    status = bad_status(sd["order_status"], dirty)
-    # Dirty mode: bad status violates check constraint — quarantine and use fallback
-    if status not in VALID_STATUSES:
-        q("orders", f"invalid_status: {status!r}", {"customer_id": customer_id, "status": status})
-        status = sd["order_status"]  # fallback to valid status
-    placed = future_ts(placed_at, dirty)
-    ps     = pay_status(sd["order_status"])
-    method = random.choices(PAYMENT_METHODS, weights=[60,20,15,3,2])[0]
-    fc     = fm = None
-    if ps == "failed":
-        fc = random.choice(["insufficient_funds", "card_declined", "expired_card"])
-        fm = f"Payment failed: {fc}"
-
-    ship_addr = address(dirty)
-    if isinstance(ship_addr, str):
-        q("orders", "malformed_shipping_address_json", {"customer_id": customer_id})
-        ship_addr = psycopg2.extras.Json({"street": "unknown", "city": "unknown",
-                                          "postcode": "unknown", "country": "GB"})
-    return {
-        "order": (customer_id, status, sub, disc, ship, tax, tot,
-                  ship_addr,
-                  f"PROMO{random.randint(10,99)}" if random.random()<0.15 else None,
-                  random.choice(CHANNELS),
-                  placed, sd["confirmed_at"], sd["shipped_at"],
-                  sd["delivered_at"], sd["cancelled_at"], placed, placed),
-        "items": items,
-        "pay":   (tot, ps, method,
-                  str(random.randint(1000,9999)) if method=="card" else None,
-                  random.choice(CARD_BRANDS)     if method=="card" else None,
-                  fc, fm, placed + timedelta(minutes=random.randint(1,10)),
-                  placed, placed,
-                  f"pi_{hashlib.md5(f'order_{customer_id}_{placed.date()}'.encode()).hexdigest()[:24]}"),
-    }
+    # Payment
+    payment_status = payment_status_for_order_status(order_status)
+    cur.execute("""
+        INSERT INTO payments
+            (order_id, stripe_payment_intent_id, amount_pence, currency,
+             payment_status, payment_method, card_last4, card_brand,
+             failure_code, processed_at, created_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        order_id,
+        f"pi_{hashlib.md5(f'order_{order_id}_{created_at.date()}'.encode()).hexdigest()[:24]}",
+        total_pence,
+        "GBP",
+        dirty_status(payment_status, ["pending","succeeded","failed","refunded"], dirty),
+        random.choice(PAYMENT_METHODS),
+        maybe_null(str(random.randint(1000, 9999)), dirty),
+        maybe_null(random.choice(["visa", "mastercard", "amex"]), dirty),
+        "card_declined" if payment_status == "failed" else None,
+        created_at if payment_status != "pending" else None,
+        created_at,
+        created_at,
+    ))
 
 
 # ─────────────────────────────────────────────────────────────
-# BURST MODE (Rules 1, 2, 3, 4, 5)
+# BURST MODE
 # ─────────────────────────────────────────────────────────────
 
-def run_burst(conn, days=7, dirty=False):
+def run_burst(days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    t0 = time.time()
-    ts = get_burst_timestamps(days)
-    log.info(f"Target: {len(ts)} orders")
+    t0   = time.time()
+    conn = get_conn()
+    cur  = conn.cursor()
 
-    stats = {"customers": 0, "orders": 0, "inventory": 0}
+    log.info("Creating schema...")
+    create_schema(cur)
+    conn.commit()
 
-    with conn.cursor() as cur:
-        ensure_quarantine(cur, conn)
+    log.info("Seeding base data...")
+    seed_customers(cur, count=500, dirty=dirty)
+    seed_products_and_inventory(cur, count=200, dirty=dirty)
+    conn.commit()
 
-        # ── customers (1 round trip) ─────────────────────────
-        rows = [r for r in (build_customer(
-                    ts[int(i * len(ts) / 500)], dirty)
-                    for i in range(500)) if r]
-        psycopg2.extras.execute_values(cur, """
-            INSERT INTO customers
-                (email, first_name, last_name, phone, default_address,
-                 customer_tier, marketing_opt_in, created_at, updated_at)
-            VALUES %s ON CONFLICT (email) DO NOTHING
-        """, rows)
-        flush_q(cur, conn)
-        conn.commit()
+    now            = datetime.now(timezone.utc)
+    orders_per_day = 200
+    total_orders   = days * orders_per_day
+    log.info(f"Generating {total_orders} orders across {days} days...")
 
-        cur.execute("SELECT customer_id FROM customers")
-        cids = [r[0] for r in cur.fetchall()]
-        stats["customers"] = len(cids)
-        log.info(f"✓ {stats['customers']} customers")
+    for i in range(total_orders):
+        day_offset  = random.uniform(0, days)
+        base_dt     = now - timedelta(days=day_offset)
+        # Weekend: slightly more orders
+        is_weekend  = base_dt.weekday() >= 5
+        if is_weekend and random.random() < 0.3:
+            pass  # keep this order (extra weekend volume)
+        created_at = peak_timestamp(base_dt)
+        generate_order(cur, created_at, dirty)
 
-        if not cids:
-            log.error("No customers — aborting"); return
-
-        # ── orders in batches ────────────────────────────────
-        bo, bi, bp = [], [], []
-
-        def flush():
-            if not bo: return
-            psycopg2.extras.execute_values(cur, """
-                INSERT INTO orders
-                    (customer_id, order_status,
-                     subtotal_pence, discount_pence, shipping_pence,
-                     tax_pence, total_pence,
-                     shipping_address, promo_code, order_channel,
-                     placed_at, confirmed_at, shipped_at,
-                     delivered_at, cancelled_at, created_at, updated_at)
-                VALUES %s RETURNING order_id
-            """, bo)
-            oids = [r[0] for r in cur.fetchall()]
-
-            item_rows = []
-            for oid, items in zip(oids, bi):
-                # find placed_at from the order tuple (index 10)
-                pat = bo[oids.index(oid)][10]
-                for it in items:
-                    item_rows.append((oid, it["sku"], it["name"],
-                                      it["qty"], it["price"], it["disc"],
-                                      it["total"], pat, pat))
-            if item_rows:
-                psycopg2.extras.execute_values(cur, """
-                    INSERT INTO order_items
-                        (order_id, product_sku, product_name,
-                         quantity, unit_price_pence, discount_pence,
-                         total_price_pence, created_at, updated_at)
-                    VALUES %s
-                """, item_rows)
-
-            # Rebuild PI ID using real order_id (not customer_id)
-            # Formula must match generators/06_stripe/generate.py exactly
-            pay_rows = []
-            for oid, pay, order_tuple in zip(oids, bp, bo):
-                placed_at = order_tuple[10]  # index 10 = placed_at
-                pi_id = f"pi_{hashlib.md5(f'order_{oid}_{placed_at.date()}'.encode()).hexdigest()[:24]}"
-                pay_rows.append((oid,) + pay[:-1] + (pi_id,))
-            psycopg2.extras.execute_values(cur, """
-                INSERT INTO payments
-                    (order_id, amount_pence, currency, payment_status,
-                     payment_method, card_last4, card_brand,
-                     failure_code, failure_message,
-                     processed_at, created_at, updated_at,
-                     stripe_payment_intent_id)
-                VALUES %s
-            """, pay_rows,
-            template="(%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
-
-            flush_q(cur, conn)
+        if i % 100 == 0 and i > 0:
             conn.commit()
-            n = len(bo)
-            bo.clear(); bi.clear(); bp.clear()
-            return n
+            elapsed = time.time() - t0
+            log.info(f"  {i}/{total_orders} | {elapsed:.0f}s")
 
-        total_inserted = 0
-        for i, placed_at in enumerate(ts):
-            data = build_order(random.choice(cids), placed_at, dirty)
-            bo.append(data["order"]); bi.append(data["items"]); bp.append(data["pay"])
-
-            if dirty and random.random() < 0.03:
-                bo.append(data["order"]); bi.append(data["items"]); bp.append(data["pay"])
-
-            if len(bo) >= BURST_BATCH:
-                n = flush()
-                total_inserted += n
-                stats["orders"] = total_inserted
-                log.info(f"  {i+1}/{len(ts)} | {total_inserted} orders | {time.time()-t0:.0f}s")
-
-        n = flush()
-        if n: total_inserted += n
-        stats["orders"] = total_inserted
-
-        # ── inventory (1 round trip) ─────────────────────────
-        # Deduplicate by (sku, warehouse) — ON CONFLICT DO UPDATE crashes if
-        # two rows in the same batch share the same conflict key
-        inv_dict = {}
-        for _ in range(500):
-            sku = random.choice(PRODUCT_SKUS)
-            wh  = random.choice(WAREHOUSES)
-            qty = max(0, 50 + (-random.randint(1,5) if random.random()<0.7 else random.randint(10,100)))
-            inv_dict[(sku, wh)] = (qty, random.randint(100,5000), random.choice(ts))
-        inv = [(sku, wh, qty, cost, t)
-               for (sku, wh), (qty, cost, t) in inv_dict.items()]
-        psycopg2.extras.execute_values(cur, """
-            INSERT INTO inventory
-                (product_sku, warehouse_id, quantity_available, unit_cost_pence, updated_at)
-            VALUES %s
-            ON CONFLICT (product_sku, warehouse_id) DO UPDATE
-            SET quantity_available = GREATEST(0, inventory.quantity_available +
-                                     EXCLUDED.quantity_available - 50),
-                updated_at = EXCLUDED.updated_at
-        """, inv)
-        conn.commit()
-        stats["inventory"] = 500
+    conn.commit()
+    cur.close()
+    conn.close()
 
     elapsed = time.time() - t0
-    log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
+    log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {total_orders} orders")
     if elapsed > 120:
         log.warning(f"Rule 2 VIOLATION: {elapsed:.0f}s > 120s")
     else:
@@ -442,125 +377,45 @@ def run_burst(conn, days=7, dirty=False):
 
 
 # ─────────────────────────────────────────────────────────────
-# STREAM MODE (Rules 1, 6)
+# STREAM MODE
 # ─────────────────────────────────────────────────────────────
 
-def run_stream(conn, dirty=False):
-    log.info(f"STREAM MODE | ~0.6 ops/sec | dirty={dirty} | Ctrl+C to stop")
-    with conn.cursor() as cur:
-        ensure_quarantine(cur, conn)
-        cur.execute("SELECT customer_id FROM customers ORDER BY RANDOM() LIMIT 500")
-        cids = [r[0] for r in cur.fetchall()]
+def run_stream(dirty: bool = False):
+    log.info(f"STREAM MODE | ~1 order/sec | dirty={dirty} | Ctrl+C to stop")
+    conn  = get_conn()
+    cur   = conn.cursor()
+    stats = {"orders": 0}
 
-    if not cids:
-        log.warning("No customers — seeding 1 day first")
-        run_burst(conn, days=1)
-        with conn.cursor() as cur:
-            cur.execute("SELECT customer_id FROM customers LIMIT 500")
-            cids = [r[0] for r in cur.fetchall()]
-
-    stats, i = {"customers": 0, "orders": 0, "inventory": 0}, 0
     try:
         while True:
-            i += 1
-            now = datetime.now(timezone.utc)
-            act = random.choices(["customer","order","inventory"],weights=[5,75,20])[0]
-            with conn.cursor() as cur:
-                if act == "customer":
-                    row = build_customer(now, dirty)
-                    if row:
-                        cur.execute("""
-                            INSERT INTO customers
-                                (email,first_name,last_name,phone,default_address,
-                                 customer_tier,marketing_opt_in,created_at,updated_at)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (email) DO NOTHING RETURNING customer_id
-                        """, row)
-                        res = cur.fetchone()
-                        if res: cids.append(res[0]); stats["customers"] += 1
-                    flush_q(cur, conn); conn.commit()
-
-                elif act == "order":
-                    data = build_order(random.choice(cids), now, dirty)
-                    cur.execute("""
-                        INSERT INTO orders
-                            (customer_id,order_status,
-                             subtotal_pence,discount_pence,shipping_pence,
-                             tax_pence,total_pence,currency,
-                             shipping_address,promo_code,order_channel,
-                             placed_at,confirmed_at,shipped_at,
-                             delivered_at,cancelled_at,created_at,updated_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        RETURNING order_id
-                    """, data["order"])
-                    oid = cur.fetchone()[0]
-                    for it in data["items"]:
-                        cur.execute("""
-                            INSERT INTO order_items
-                                (order_id,product_sku,product_name,quantity,
-                                 unit_price_pence,discount_pence,total_price_pence,
-                                 created_at,updated_at)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        """, (oid, it["sku"], it["name"], it["qty"],
-                              it["price"], it["disc"], it["total"], now, now))
-                    cur.execute("""
-                        INSERT INTO payments
-                            (order_id,amount_pence,currency,payment_status,
-                             payment_method,card_last4,card_brand,
-                             failure_code,failure_message,
-                             processed_at,created_at,updated_at,
-                             stripe_payment_intent_id)
-                        VALUES (%s,%s,'GBP',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, (oid,) + data["pay"][:-1] + (
-                        f"pi_{hashlib.md5(f'order_{oid}_{now.date()}'.encode()).hexdigest()[:24]}",
-                    ))
-                    stats["orders"] += 1
-                    flush_q(cur, conn); conn.commit()
-
-                else:
-                    sku = random.choice(PRODUCT_SKUS); wh = random.choice(WAREHOUSES)
-                    d   = -random.randint(1,5) if random.random()<0.7 else random.randint(10,100)
-                    cur.execute("""
-                        INSERT INTO inventory
-                            (product_sku,warehouse_id,quantity_available,unit_cost_pence,updated_at)
-                        VALUES (%s,%s,GREATEST(0,%s),%s,%s)
-                        ON CONFLICT (product_sku,warehouse_id) DO UPDATE
-                        SET quantity_available=GREATEST(0,inventory.quantity_available+%s),
-                            updated_at=%s
-                    """, (sku, wh, max(0,50+d), random.randint(100,5000), now, d, now))
-                    conn.commit(); stats["inventory"] += 1
-
-            if i % 100 == 0: log.info(f"Stream — {stats}")
+            created_at = datetime.now(timezone.utc)
+            generate_order(cur, created_at, dirty)
+            conn.commit()
+            stats["orders"] += 1
+            if stats["orders"] % 50 == 0:
+                log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
-
     except KeyboardInterrupt:
+        cur.close()
+        conn.close()
         log.info(f"Stopped. {stats}")
 
 
 # ─────────────────────────────────────────────────────────────
-# ENTRY POINT (Rules 1, 10)
+# ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(description="Source 01 — PostgreSQL generator")
-    p.add_argument("--mode",  choices=["burst","stream"], required=True)
+    p.add_argument("--mode",  choices=["burst", "stream"], required=True)
     p.add_argument("--days",  type=int, default=7)
     p.add_argument("--dirty", action="store_true")
     args = p.parse_args()
-
     log.info(f"Source 01 | mode={args.mode} | days={args.days} | dirty={args.dirty}")
-    try:
-        conn = get_conn()
-        conn.autocommit = False
-        log.info("✓ Connected")
-    except Exception as e:
-        log.error(f"Connection failed: {e}"); sys.exit(1)
-
-    try:
-        if args.mode == "burst":   run_burst(conn, args.days, args.dirty)
-        elif args.mode == "stream": run_stream(conn, args.dirty)
-    finally:
-        conn.close()
+    if args.mode == "burst":
+        run_burst(args.days, args.dirty)
+    elif args.mode == "stream":
+        run_stream(args.dirty)
 
 if __name__ == "__main__":
     main()

@@ -118,14 +118,12 @@ def load_entity_ids(limit: int = 1000) -> dict:
         result["product_skus"] = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
 
     # Rule 14 — order amounts: {order_id: total_pence}
-    # Used by any generator that has both order_id AND a monetary amount field
+    # No LIMIT — must load ALL orders so ERP/Stripe amounts always match exactly
     cur.execute("""
-        SELECT order_id, total_amount_pence
+        SELECT order_id, total_pence
         FROM orders
-        WHERE total_amount_pence > 0
-        ORDER BY RANDOM()
-        LIMIT %s
-    """, (limit,))
+        WHERE total_pence > 0
+    """)
     result["order_amounts"] = {row[0]: row[1] for row in cur.fetchall()}
 
     # Cross-field referential integrity — Rule: never pick order_id and product_sku independently
