@@ -87,34 +87,60 @@ def build_discount(created_at: datetime, dirty: bool = False) -> dict:
         "_source":         "shopify_graphql",
     }
 
-def write_batch(items, output_dir, batch_num, ts, record_type="products"):
-    dp = output_dir / ts.strftime("%Y/%m/%d/%H"); dp.mkdir(parents=True, exist_ok=True)
-    with open(dp / f"shopify_{record_type}_{batch_num:04d}.json","w") as f:
-        json.dump({"batch": batch_num, "type": record_type, "count": len(items), "edges": [{"node": r} for r in items]}, f, default=str)
+def write_daily_file(items, output_dir, day_dt, record_type="products"):
+    """
+    Write all records for one day to a single file.
+    Folder: output_dir/YYYY/MM/DD/
+    Filename: shopify_products_YYYYMMDD.json or shopify_discounts_YYYYMMDD.json
+    No hour subfolder — Shopify is a daily batch export.
+    """
+    dp = output_dir / day_dt.strftime("%Y/%m/%d")
+    dp.mkdir(parents=True, exist_ok=True)
+    fname = f"shopify_{record_type}_{day_dt.strftime('%Y%m%d')}.json"
+    with open(dp / fname, "w") as f:
+        json.dump({
+            "date":        day_dt.strftime("%Y-%m-%d"),
+            "type":        record_type,
+            "count":       len(items),
+            "edges":       [{"node": r} for r in items],
+        }, f, default=str)
+    log.info(f"  Written: {fname} ({len(items)} {record_type})")
 
 def run_burst(output_dir, days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
-    t0, stats, now = time.time(), {"products":0,"discounts":0}, datetime.now(timezone.utc)
+    t0, stats, now = time.time(), {"products": 0, "discounts": 0, "files": 0}, datetime.now(timezone.utc)
+    skus = get_entity_ids()["product_skus"]
+
     for day_offset in range(days):
         base_dt = now - timedelta(days=day_offset)
-        products = [build_product(sku, base_dt, dirty) for sku in random.sample(get_entity_ids()["product_skus"], min(50, len(get_entity_ids()["product_skus"])))]
-        write_batch(products, output_dir, day_offset, base_dt)
+        day_key = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Products — one file per day
+        products = [build_product(sku, base_dt, dirty)
+                    for sku in random.sample(skus, min(50, len(skus)))]
+        write_daily_file(products, output_dir, day_key, "products")
         stats["products"] += len(products)
+        stats["files"]    += 1
+
+        # Discounts — one file per day
         discounts = [build_discount(base_dt, dirty) for _ in range(10)]
-        write_batch(discounts, output_dir, day_offset, base_dt, "discounts")
+        write_daily_file(discounts, output_dir, day_key, "discounts")
         stats["discounts"] += len(discounts)
+        stats["files"]     += 1
+
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
     log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~2K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"sent":0}, 0
+    get_entity_ids(); stats, i = {"sent": 0}, 0
     try:
         while True:
-            i += 1; now = datetime.now(timezone.utc)
-            sku = random.choice(get_entity_ids()["product_skus"])
-            write_batch([build_product(sku, now, dirty)], output_dir, i, now)
+            i   += 1; now = datetime.now(timezone.utc)
+            sku  = random.choice(get_entity_ids()["product_skus"])
+            day_key = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            write_daily_file([build_product(sku, now, dirty)], output_dir, day_key, "products")
             stats["sent"] += 1
             if i % 50 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
