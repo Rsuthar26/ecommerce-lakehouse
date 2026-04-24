@@ -117,6 +117,17 @@ def load_entity_ids(limit: int = 1000) -> dict:
         log.warning("No product_skus found in order_items — using deterministic fallback")
         result["product_skus"] = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
 
+    # Rule 14 — order amounts: {order_id: total_pence}
+    # Used by any generator that has both order_id AND a monetary amount field
+    cur.execute("""
+        SELECT order_id, total_pence
+        FROM orders
+        WHERE total_pence > 0
+        ORDER BY RANDOM()
+        LIMIT %s
+    """, (limit,))
+    result["order_amounts"] = {row[0]: row[1] for row in cur.fetchall()}
+
     cur.close()
     conn.close()
 
@@ -124,6 +135,7 @@ def load_entity_ids(limit: int = 1000) -> dict:
         f"Loaded: {len(result['customer_ids'])} customers, "
         f"{len(result['order_ids'])} orders, "
         f"{len(result['shipped_order_ids'])} shipped orders, "
-        f"{len(result['product_skus'])} SKUs"
+        f"{len(result['product_skus'])} SKUs, "
+        f"{len(result['order_amounts'])} order amounts"
     )
     return result

@@ -40,7 +40,9 @@ def maybe_null(v, dirty, base=0.05, elev=0.20):
 def build_invoice(created_at: datetime, dirty: bool = False) -> dict:
     ids      = get_entity_ids()
     order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else None
-    amount   = random.randint(1000, 500000)
+
+    # Rule 14: amount must come from Postgres when order_id is present
+    amount   = ids["order_amounts"].get(order_id, random.randint(1000, 50000))
     inv_num  = f"INV-{hashlib.md5(f'{order_id}_{created_at.date()}'.encode()).hexdigest()[:8].upper()}"
     status   = "paid" if (datetime.now(timezone.utc) - created_at).days > 30 else random.choice(["issued","overdue","paid"])
     return {
@@ -71,9 +73,9 @@ def invoice_to_xml(invoice: dict) -> str:
     lines.append("</Invoice>")
     return "\n".join(lines)
 
-def write_erp_file(records, output_dir, batch_num, ts, fmt="json"):
+def write_erp_file(records, output_dir, ts, fmt="json"):
     dp = output_dir / ts.strftime("%Y/%m/%d"); dp.mkdir(parents=True, exist_ok=True)
-    fname = f"erp_export_{batch_num:04d}.{fmt}"
+    fname = f"erp_export_{ts.strftime('%Y%m%d')}.{fmt}"
     if fmt == "json":
         with open(dp / fname, "w") as f:
             json.dump({"export_date": ts.isoformat(), "count": len(records), "invoices": records}, f, default=str)
@@ -94,9 +96,9 @@ def run_burst(output_dir, days=7, dirty=False):
         records = [build_invoice(base_dt - timedelta(hours=random.uniform(0,23)), dirty)
                    for _ in range(random.randint(20, 50))]
         # JSON export
-        write_erp_file(records, output_dir, day_offset*2, base_dt, "json")
+        write_erp_file(records, output_dir, base_dt, "json")
         # XML export (same data, different format)
-        write_erp_file(records, output_dir, day_offset*2+1, base_dt, "xml")
+        write_erp_file(records, output_dir, base_dt, "xml")
         stats["files"] += 2; stats["records"] += len(records)
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
@@ -110,7 +112,7 @@ def run_stream(output_dir, dirty=False):
             i += 1; now = datetime.now(timezone.utc)
             records = [build_invoice(now, dirty) for _ in range(random.randint(5,20))]
             fmt = random.choice(["json","xml"])
-            write_erp_file(records, output_dir, i, now, fmt)
+            write_erp_file(records, output_dir, now, fmt)
             stats["files"] += 1
             if i % 10 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
