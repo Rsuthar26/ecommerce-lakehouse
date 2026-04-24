@@ -103,16 +103,37 @@ def write_parquet(rows, file_path):
 def write_avro(rows, file_path):
     try:
         import fastavro
-        schema = {"type":"record","name":"PartnerSale","fields":[
-            {"name":k,"type":["null","string"],"default":None} for k in rows[0].keys()
-        ]}
-        with open(file_path,"wb") as f:
-            fastavro.writer(f, fastavro.parse_schema(schema), rows)
+        schema = {
+            "type": "record",
+            "name": "PartnerSale",
+            "fields": [
+                {"name": "partner_id",        "type": ["null", "string"],  "default": None},
+                {"name": "partner_name",       "type": ["null", "string"],  "default": None},
+                {"name": "partner_type",       "type": ["null", "string"],  "default": None},
+                {"name": "sale_id",            "type": ["null", "string"],  "default": None},
+                {"name": "product_sku",        "type": ["null", "string"],  "default": None},
+                {"name": "sale_amount_gbp",    "type": ["null", "double"],  "default": None},
+                {"name": "commission_gbp",     "type": ["null", "double"],  "default": None},
+                {"name": "currency",           "type": ["null", "string"],  "default": None},
+                {"name": "sale_status",        "type": ["null", "string"],  "default": None},
+                {"name": "channel",            "type": ["null", "string"],  "default": None},
+                {"name": "customer_email",     "type": ["null", "string"],  "default": None},
+                {"name": "sale_date",          "type": ["null", "string"],  "default": None},
+                {"name": "created_at",         "type": ["null", "string"],  "default": None},
+                {"name": "updated_at",         "type": ["null", "string"],  "default": None},
+                {"name": "click_id",           "type": ["null", "string"],  "default": None},
+                {"name": "campaign_id",        "type": ["null", "string"],  "default": None},
+                {"name": "is_first_purchase",  "type": ["null", "boolean"], "default": None},
+            ]
+        }
+        parsed_schema = fastavro.parse_schema(schema)
+        with open(file_path, "wb") as f:
+            fastavro.writer(f, parsed_schema, rows)
         return len(rows)
     except ImportError:
         log.warning("fastavro not installed — writing JSON Lines")
-        with open(file_path.with_suffix(".jsonl"),"w") as f:
-            for r in rows: f.write(json.dumps(r, default=str)+"\n")
+        with open(file_path.with_suffix(".jsonl"), "w") as f:
+            for r in rows: f.write(json.dumps(r, default=str) + "\n")
         return len(rows)
 
 def run_burst(output_dir, days=7, dirty=False):
@@ -133,7 +154,6 @@ def run_burst(output_dir, days=7, dirty=False):
             if filepath.exists():  # Rule 5: idempotent — skip if already written
                 log.info(f"  Skipped (exists): {filepath.name}")
                 continue
-            if filepath.exists(): continue  # Rule 5 — idempotent: skip if already written
             written  = write_parquet(rows, filepath) if partner["format"] == "parquet" else write_avro(rows, filepath)
             stats["files"] += 1; stats["total_rows"] += written
             log.info(f"  Written: {filepath.name} ({written} rows)")
