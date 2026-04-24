@@ -63,8 +63,16 @@ def delivery_status_for_age(sent_at: datetime) -> str:
 def build_ses_event(sent_at: datetime, dirty: bool = False) -> dict:
     ids         = get_entity_ids()
     email_type  = random.choice(EMAIL_TYPES)
-    order_id    = random.choice(ids["order_ids"]) if ids["order_ids"] else None       # Rule 11
-    customer_id = random.choice(ids["customer_ids"]) if ids["customer_ids"] else None # Rule 11
+    order_id    = random.choice(ids["order_ids"]) if ids["order_ids"] else None
+
+    # Cross-field integrity fix: customer_id must come from the same order row
+    # For transactional emails (order present) — look up customer from that order
+    # For marketing/password emails (no order) — pick independently from customer list
+    is_order_email = email_type not in ("marketing_weekly", "marketing_promo", "password_reset")
+    if is_order_email and order_id is not None:
+        customer_id = ids["order_customers"].get(order_id)   # always consistent with order_id
+    else:
+        customer_id = random.choice(ids["customer_ids"]) if ids["customer_ids"] else None
     recipient   = bad_email_address(fake.email(), dirty)
     message_id  = f"<{uuid.uuid4().hex}@eu-west-1.amazonses.com>"
     status      = delivery_status_for_age(sent_at)
@@ -127,36 +135,59 @@ def build_ses_event(sent_at: datetime, dirty: bool = False) -> dict:
 
     return event
 
-def write_batch(events, output_dir, batch_num, ts):
-    dp = output_dir / ts.strftime("%Y/%m/%d/%H"); dp.mkdir(parents=True, exist_ok=True)
-    with open(dp / f"ses_events_{batch_num:04d}.json","w") as f:
-        json.dump({"batch": batch_num, "count": len(events),
-                   "source": "aws:ses", "fetched_at": ts.isoformat(),
-                   "events": events}, f, default=str)
+def write_hour_file(events, output_dir, hour_dt):
+    """
+    Write all SES events for one hour to a single file.
+    Folder: output_dir/YYYY/MM/DD/HH/
+    Filename: ses_events_YYYYMMDD_HH00_to_YYYYMMDD_HH59.json
+    """
+    dp = output_dir / hour_dt.strftime("%Y/%m/%d/%H")
+    dp.mkdir(parents=True, exist_ok=True)
+    fname = (
+        f"ses_events_"
+        f"{hour_dt.strftime('%Y%m%d_%H')}00_to_"
+        f"{hour_dt.strftime('%Y%m%d_%H')}59.json"
+    )
+    with open(dp / fname, "w") as f:
+        json.dump({
+            "hour":       hour_dt.strftime("%Y-%m-%d %H:00 UTC"),
+            "count":      len(events),
+            "source":     "aws:ses",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "events":     events,
+        }, f, default=str)
+    log.info(f"  Written: {fname} ({len(events)} events)")
 
 def run_burst(output_dir, days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
-    t0, stats = time.time(), {"events":0,"batches":0}
-    total, batch_size, buf, bn = days * 5000, 100, [], 0
-    now = datetime.now(timezone.utc)
+    t0, stats = time.time(), {"events": 0, "files": 0}
+    total = days * 5000
+    now   = datetime.now(timezone.utc)
+
+    hour_buckets: dict = {}
     for _ in range(total):
         days_ago = random.uniform(0, days)
         sent_at  = now - timedelta(days=days_ago)
-        buf.append(build_ses_event(sent_at, dirty)); stats["events"] += 1
-        if len(buf) >= batch_size:
-            write_batch(buf, output_dir, bn, sent_at); stats["batches"] += 1; bn += 1; buf = []
-    if buf: write_batch(buf, output_dir, bn, datetime.now(timezone.utc)); stats["batches"] += 1
+        hour_key = sent_at.replace(minute=0, second=0, microsecond=0)
+        hour_buckets.setdefault(hour_key, []).append(build_ses_event(sent_at, dirty))
+        stats["events"] += 1
+
+    for hour_dt, events in sorted(hour_buckets.items()):
+        write_hour_file(events, output_dir, hour_dt)
+        stats["files"] += 1
+
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
     log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~5K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"events":0}, 0
+    get_entity_ids(); stats, i = {"events": 0}, 0
     try:
         while True:
-            i += 1; now = datetime.now(timezone.utc)
-            write_batch([build_ses_event(now, dirty)], output_dir, i, now)
+            i   += 1; now = datetime.now(timezone.utc)
+            hour_key = now.replace(minute=0, second=0, microsecond=0)
+            write_hour_file([build_ses_event(now, dirty)], output_dir, hour_key)
             stats["events"] += 1
             if i % 100 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
