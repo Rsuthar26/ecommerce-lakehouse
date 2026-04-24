@@ -120,13 +120,35 @@ def load_entity_ids(limit: int = 1000) -> dict:
     # Rule 14 — order amounts: {order_id: total_pence}
     # Used by any generator that has both order_id AND a monetary amount field
     cur.execute("""
-        SELECT order_id, total_pence
+        SELECT order_id, total_amount_pence
         FROM orders
-        WHERE total_pence > 0
+        WHERE total_amount_pence > 0
         ORDER BY RANDOM()
         LIMIT %s
     """, (limit,))
     result["order_amounts"] = {row[0]: row[1] for row in cur.fetchall()}
+
+    # Cross-field referential integrity — Rule: never pick order_id and product_sku independently
+    # order_items: list of (order_id, product_sku) tuples that actually exist together
+    cur.execute("""
+        SELECT order_id, product_sku
+        FROM order_items
+        ORDER BY RANDOM()
+        LIMIT %s
+    """, (limit,))
+    result["order_items"] = [(row[0], row[1]) for row in cur.fetchall()]
+
+    # order_customers: {order_id: customer_id} — never pick independently
+    if result["order_items"]:
+        order_ids_in_items = list({pair[0] for pair in result["order_items"]})
+        cur.execute("""
+            SELECT order_id, customer_id
+            FROM orders
+            WHERE order_id = ANY(%s)
+        """, (order_ids_in_items,))
+        result["order_customers"] = {row[0]: row[1] for row in cur.fetchall()}
+    else:
+        result["order_customers"] = {}
 
     cur.close()
     conn.close()
@@ -136,6 +158,8 @@ def load_entity_ids(limit: int = 1000) -> dict:
         f"{len(result['order_ids'])} orders, "
         f"{len(result['shipped_order_ids'])} shipped orders, "
         f"{len(result['product_skus'])} SKUs, "
-        f"{len(result['order_amounts'])} order amounts"
+        f"{len(result['order_amounts'])} order amounts, "
+        f"{len(result['order_items'])} order-item pairs, "
+        f"{len(result['order_customers'])} order-customer mappings"
     )
     return result

@@ -88,9 +88,19 @@ def ticket_status_for_age(created_at: datetime) -> str:
     else:              return random.choices(["resolved","closed"], weights=[0.5,0.5])[0]
 
 def build_review(created_at: datetime, dirty: bool = False) -> dict:
-    ids      = get_entity_ids()
-    order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else None
-    sku      = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+    ids = get_entity_ids()
+
+    # Cross-join fix: pick (order_id, product_sku) as a joined tuple — never independently
+    # A review must reference a SKU that actually exists in that order's items
+    if ids["order_items"]:
+        order_id, sku = random.choice(ids["order_items"])
+    else:
+        order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else None
+        sku      = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+
+    # customer_id comes from orders.customer_id for this order — never picked independently
+    customer_id = ids["order_customers"].get(order_id)
+
     rating   = random.choices([1,2,3,4,5], weights=[0.05,0.08,0.12,0.30,0.45])[0]
 
     if rating >= 4:   body = random.choice(REVIEW_POSITIVE)
@@ -106,7 +116,7 @@ def build_review(created_at: datetime, dirty: bool = False) -> dict:
         "review_id":     hashlib.md5(f"review_{order_id}_{created_at.isoformat()}".encode()).hexdigest()[:16],
         "order_id":      maybe_null(order_id, dirty, base=0.01),
         "product_sku":   maybe_null(sku, dirty, base=0.01),
-        "customer_id":   maybe_null(random.choice(ids["customer_ids"]) if ids["customer_ids"] else None, dirty),
+        "customer_id":   maybe_null(customer_id, dirty),
         "rating":        maybe_null(rating, dirty),
         "title":         maybe_null(fake.sentence(nb_words=5), dirty),
         "body":          maybe_null(body, dirty),
@@ -117,9 +127,18 @@ def build_review(created_at: datetime, dirty: bool = False) -> dict:
     }
 
 def build_ticket(created_at: datetime, dirty: bool = False) -> dict:
-    ids      = get_entity_ids()
-    order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else 12345
-    sku      = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+    ids = get_entity_ids()
+
+    # Cross-join fix: pick (order_id, product_sku) as joined tuple
+    if ids["order_items"]:
+        order_id, sku = random.choice(ids["order_items"])
+    else:
+        order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else 12345
+        sku      = random.choice(ids["product_skus"]) if ids["product_skus"] else "SKU-00001"
+
+    # customer_id from orders table for this order — never picked independently
+    customer_id = ids["order_customers"].get(order_id)
+
     template = random.choice(TICKET_TEMPLATES)
     body     = template.format(order_id=order_id, days=random.randint(3,14), sku=sku)
 
@@ -127,7 +146,7 @@ def build_ticket(created_at: datetime, dirty: bool = False) -> dict:
         "record_type":  "ticket",
         "ticket_id":    f"TKT-{hashlib.md5(f'ticket_{order_id}_{created_at.isoformat()}'.encode()).hexdigest()[:8].upper()}",
         "order_id":     maybe_null(order_id, dirty, base=0.02),
-        "customer_id":  maybe_null(random.choice(ids["customer_ids"]) if ids["customer_ids"] else None, dirty),
+        "customer_id":  maybe_null(customer_id, dirty),
         "category":     maybe_null(random.choice(TICKET_CATEGORIES), dirty),
         "status":       ticket_status_for_age(created_at),
         "priority":     maybe_null(random.choice(["low","medium","high","urgent"]), dirty),
@@ -143,37 +162,74 @@ def build_ticket(created_at: datetime, dirty: bool = False) -> dict:
         **( {"created_at": "2099-01-01T00:00:00+00:00"} if dirty and random.random() < 0.02 else {} ),
     }
 
-def write_batch(records, output_dir, batch_num, ts):
-    dp = output_dir / ts.strftime("%Y/%m/%d"); dp.mkdir(parents=True, exist_ok=True)
-    with open(dp / f"text_records_{batch_num:04d}.json","w") as f:
-        json.dump({"batch": batch_num, "count": len(records), "records": records}, f, default=str)
+def write_daily_file(records, output_dir, day_dt, record_type):
+    """
+    Write one file per type per day.
+    reviews  → reviews_YYYYMMDD.json
+    tickets  → tickets_YYYYMMDD.json
+    Folder: output_dir/YYYY/MM/DD/
+    """
+    dp = output_dir / day_dt.strftime("%Y/%m/%d")
+    dp.mkdir(parents=True, exist_ok=True)
+    fname = f"{record_type}_{day_dt.strftime('%Y%m%d')}.json"
+    with open(dp / fname, "w") as f:
+        json.dump({
+            "date":        day_dt.strftime("%Y-%m-%d"),
+            "record_type": record_type,
+            "count":       len(records),
+            "records":     records,
+        }, f, default=str)
+    log.info(f"  Written: {fname} ({len(records)} {record_type})")
 
 def run_burst(output_dir, days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
-    t0, stats, now = time.time(), {"records":0,"batches":0}, datetime.now(timezone.utc)
-    total, batch_size, buf, bn = days * 150, 50, [], 0
+    t0, stats, now = time.time(), {"reviews": 0, "tickets": 0, "files": 0}, datetime.now(timezone.utc)
+    total = days * 150
+
+    # Separate day buckets per type
+    review_buckets: dict = {}
+    ticket_buckets: dict = {}
+
     for _ in range(total):
         days_ago   = random.uniform(0, days)
         base_dt    = now - timedelta(days=days_ago)
         created_at = customer_hours_timestamp(base_dt)
-        record     = build_review(created_at, dirty) if random.random() > 0.4 else build_ticket(created_at, dirty)
-        buf.append(record); stats["records"] += 1
-        if len(buf) >= batch_size:
-            write_batch(buf, output_dir, bn, created_at); bn += 1; buf = []
-    if buf: write_batch(buf, output_dir, bn, datetime.now(timezone.utc)); stats["batches"] = bn+1
+        day_key    = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if random.random() > 0.4:
+            record = build_review(created_at, dirty)
+            review_buckets.setdefault(day_key, []).append(record)
+            stats["reviews"] += 1
+        else:
+            record = build_ticket(created_at, dirty)
+            ticket_buckets.setdefault(day_key, []).append(record)
+            stats["tickets"] += 1
+
+    for day_dt, records in sorted(review_buckets.items()):
+        write_daily_file(records, output_dir, day_dt, "reviews")
+        stats["files"] += 1
+
+    for day_dt, records in sorted(ticket_buckets.items()):
+        write_daily_file(records, output_dir, day_dt, "tickets")
+        stats["files"] += 1
+
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
     log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~1K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"records":0}, 0
+    get_entity_ids(); stats, i = {"reviews": 0, "tickets": 0}, 0
     try:
         while True:
             i += 1; now = datetime.now(timezone.utc)
-            record = build_review(now, dirty) if random.random() > 0.4 else build_ticket(now, dirty)
-            write_batch([record], output_dir, i, now)
-            stats["records"] += 1
+            day_key = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            if random.random() > 0.4:
+                write_daily_file([build_review(now, dirty)], output_dir, day_key, "reviews")
+                stats["reviews"] += 1
+            else:
+                write_daily_file([build_ticket(now, dirty)], output_dir, day_key, "tickets")
+                stats["tickets"] += 1
             if i % 50 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
     except KeyboardInterrupt: log.info(f"Stopped. {stats}")
