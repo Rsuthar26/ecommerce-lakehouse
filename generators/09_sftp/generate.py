@@ -24,9 +24,45 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from generators.shared.postgres_ids import load_entity_ids
 
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 fake = Faker("en_GB"); Faker.seed(42)
+
+# ─────────────────────────────────────────────────────────────
+# MONGODB PRICE CACHE — supplier cost must be below retail price
+# Supplier cost = 35-65% of our MongoDB base_price_pence.
+# Never random — a supplier cost higher than retail is nonsensical.
+# ─────────────────────────────────────────────────────────────
+
+_mongo_prices: dict = {}
+
+def load_mongo_prices() -> dict:
+    global _mongo_prices
+    if _mongo_prices:
+        return _mongo_prices
+    try:
+        from pymongo import MongoClient
+        mongo_uri = os.environ.get(
+            "MONGO_URI",
+            "mongodb+srv://mongo_admin:MongoAdmin2026!@ecommerce-cluster.k2gc71w.mongodb.net/"
+        )
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        cursor = client["ecommerce"]["products"].find(
+            {"base_price_pence": {"$exists": True, "$gt": 0}},
+            {"product_sku": 1, "base_price_pence": 1, "_id": 0}
+        )
+        _mongo_prices = {
+            doc["product_sku"]: doc["base_price_pence"]
+            for doc in cursor
+            if doc.get("product_sku") and doc.get("base_price_pence")
+        }
+        client.close()
+        log.info(f"Loaded {len(_mongo_prices)} product prices from MongoDB")
+    except Exception as e:
+        log.warning(f"MongoDB unavailable ({e}) — supplier cost will use random fallback")
+        _mongo_prices = {}
+    return _mongo_prices
 
 STREAM_SLEEP = 86400 / 3   # Rule 13: ~3 files/day
 
@@ -80,7 +116,8 @@ def generate_supplier_csv(supplier, drop_date, dirty=False):
     rows    = [headers]
 
     for sku in skus:
-        cost_price = random.randint(100, 15000)
+        retail_price = load_mongo_prices().get(sku, random.randint(499, 29999))
+        cost_price   = int(retail_price * random.uniform(0.35, 0.65))
         stock_qty  = random.randint(0, 500)
         lead_days  = random.randint(1, 14)
         ean        = str(random.randint(1000000000000, 9999999999999))
@@ -119,8 +156,8 @@ def generate_supplier_excel(supplier, drop_date, dirty=False):
         ws.append(["Product Code","Description","RRP GBP","Cost Price GBP","Stock","Warehouse","Updated Date"])
         skus = random.sample(ids["product_skus"], min(len(ids["product_skus"]), random.randint(20,60)))
         for sku in skus:
-            rrp   = random.randint(499, 29999)
-            cost  = int(rrp * random.uniform(0.4, 0.7))
+            rrp   = load_mongo_prices().get(sku, random.randint(499, 29999))
+            cost  = int(rrp * random.uniform(0.35, 0.65))
             stock = random.randint(0, 300)
             ws.append([
                 dirty_sku(sku, dirty),
@@ -148,7 +185,7 @@ def quarantine(output_dir, reason, data):
         json.dump({"reason": reason, "data": data, "ts": datetime.now(timezone.utc).isoformat()}, f, default=str)
 
 def run_burst(output_dir, days=7, dirty=False):
-    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
+    log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids(); load_mongo_prices()
     t0, stats, now = time.time(), {"files":0}, datetime.now(timezone.utc)
     for day_offset in range(days):
         drop_date = now - timedelta(days=day_offset)
@@ -161,7 +198,6 @@ def run_burst(output_dir, days=7, dirty=False):
             if filepath.exists():  # Rule 5: idempotent — skip if already written
                 log.info(f"  Skipped (exists): {filename}")
                 continue
-            if filepath.exists(): continue  # Rule 5 — idempotent: skip if already written
             with open(filepath, "wb") as f: f.write(content)
             stats["files"] += 1
             log.info(f"  Written: {filename} ({len(content):,} bytes)")
@@ -171,7 +207,7 @@ def run_burst(output_dir, days=7, dirty=False):
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~3 files/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"files":0}, 0
+    get_entity_ids(); load_mongo_prices(); stats, i = {"files":0}, 0
     try:
         while True:
             i += 1; supplier = random.choice(SUPPLIERS); now = datetime.now(timezone.utc)

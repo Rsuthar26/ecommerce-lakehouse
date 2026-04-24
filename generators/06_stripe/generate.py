@@ -165,7 +165,7 @@ def build_stripe_charge(created_at: datetime, dirty: bool = False) -> dict:
     charge = {
         "object":        "charge",
         "id":            f"ch_{fake.uuid4().replace('-','')[:24]}",
-        "payment_intent": maybe_null(pi_id, dirty, base=0.01),
+        "payment_intent_id": maybe_null(pi_id, dirty, base=0.01),
         "amount":         amount_pence,
         "amount_captured": amount_pence if status == "succeeded" else 0,
         "amount_refunded": 0,
