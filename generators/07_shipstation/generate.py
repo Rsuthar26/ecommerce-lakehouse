@@ -84,34 +84,59 @@ def build_shipment(created_at: datetime, dirty: bool = False) -> dict:
         **( {"shipped_at": "2099-01-01T00:00:00+00:00"} if dirty and random.random() < 0.02 else {} ),
     }
 
-def write_batch(items, output_dir, batch_num, ts):
-    dp = output_dir / ts.strftime("%Y/%m/%d/%H"); dp.mkdir(parents=True, exist_ok=True)
-    with open(dp / f"shipstation_{batch_num:04d}.json","w") as f:
-        json.dump({"batch": batch_num, "count": len(items), "items": items}, f, default=str)
+def write_daily_file(items, output_dir, day_dt):
+    """
+    Write all shipments for one day to a single file.
+    Folder: output_dir/YYYY/MM/DD/
+    Filename: shipstation_shipments_YYYYMMDD.json
+    Each file contains ONLY shipments where shipped_at falls on that day.
+    """
+    dp = output_dir / day_dt.strftime("%Y/%m/%d")
+    dp.mkdir(parents=True, exist_ok=True)
+    fname = f"shipstation_shipments_{day_dt.strftime('%Y%m%d')}.json"
+    with open(dp / fname, "w") as f:
+        json.dump({
+            "date":  day_dt.strftime("%Y-%m-%d"),
+            "count": len(items),
+            "items": items
+        }, f, default=str)
+    log.info(f"  Written: {fname} ({len(items)} shipments)")
 
 def run_burst(output_dir, days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
-    t0, stats, now = time.time(), {"sent":0}, datetime.now(timezone.utc)
-    total, batch_size, buf, bn = days * 700, 100, [], 0
+    t0, stats, now = time.time(), {"sent": 0, "files": 0}, datetime.now(timezone.utc)
+    total = days * 700
+
+    # Collect shipments grouped by day — one file per day
+    day_buckets: dict = {}
     for _ in range(total):
-        days_ago = random.uniform(0, days)
-        base_dt = now - timedelta(days=days_ago)
-        s = build_shipment(dispatch_timestamp(base_dt), dirty)
-        buf.append(s); stats["sent"] += 1
-        if len(buf) >= batch_size:
-            write_batch(buf, output_dir, bn, base_dt); bn += 1; buf = []
-    if buf: write_batch(buf, output_dir, bn, datetime.now(timezone.utc))
+        days_ago   = random.uniform(0, days)
+        base_dt    = now - timedelta(days=days_ago)
+        s          = build_shipment(dispatch_timestamp(base_dt), dirty)
+        day_key    = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if day_key not in day_buckets:
+            day_buckets[day_key] = []
+        day_buckets[day_key].append(s)
+        stats["sent"] += 1
+
+    for day_dt, items in sorted(day_buckets.items()):
+        write_daily_file(items, output_dir, day_dt)
+        stats["files"] += 1
+
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
     log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~5K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"sent":0}, 0
+    get_entity_ids(); stats, i = {"sent": 0}, 0
     try:
         while True:
-            i += 1; now = datetime.now(timezone.utc)
-            write_batch([build_shipment(now, dirty)], output_dir, i, now)
+            i  += 1; now = datetime.now(timezone.utc)
+            s   = build_shipment(now, dirty)
+            # Stream: append to today's daily file
+            day_key = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            write_daily_file([s], output_dir, day_key)
             stats["sent"] += 1
             if i % 100 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
