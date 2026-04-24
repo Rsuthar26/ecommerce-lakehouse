@@ -111,36 +111,53 @@ def build_price_record(scraped_at: datetime, dirty: bool = False) -> dict:
 
     return record
 
-def write_batch(records, output_dir, batch_num, ts):
-    dp = output_dir / ts.strftime("%Y/%m/%d"); dp.mkdir(parents=True, exist_ok=True)
-    with open(dp / f"competitor_prices_{batch_num:04d}.json","w") as f:
-        json.dump({"batch": batch_num, "count": len(records),
-                   "scraped_at": ts.isoformat(), "records": records}, f, default=str)
+def write_daily_file(records, output_dir, day_dt):
+    """
+    Write all scraped prices for one day to a single file.
+    Folder: output_dir/YYYY/MM/DD/
+    Filename: competitor_prices_YYYYMMDD.json
+    """
+    dp = output_dir / day_dt.strftime("%Y/%m/%d")
+    dp.mkdir(parents=True, exist_ok=True)
+    fname = f"competitor_prices_{day_dt.strftime('%Y%m%d')}.json"
+    with open(dp / fname, "w") as f:
+        json.dump({
+            "date":       day_dt.strftime("%Y-%m-%d"),
+            "count":      len(records),
+            "scraped_at": day_dt.isoformat(),
+            "records":    records,
+        }, f, default=str)
+    log.info(f"  Written: {fname} ({len(records)} records)")
 
 def run_burst(output_dir, days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids()
-    t0, stats, now = time.time(), {"records":0,"batches":0}, datetime.now(timezone.utc)
-    total, batch_size, buf, bn = days * 300, 100, [], 0
+    t0, stats, now = time.time(), {"records": 0, "files": 0}, datetime.now(timezone.utc)
+    total = days * 300
+
+    day_buckets: dict = {}
     for _ in range(total):
         days_ago   = random.uniform(0, days)
         scraped_at = now - timedelta(days=days_ago)
-        record     = build_price_record(scraped_at, dirty)
-        buf.append(record); stats["records"] += 1
-        if len(buf) >= batch_size:
-            write_batch(buf, output_dir, bn, scraped_at); bn += 1; buf = []
-    if buf: write_batch(buf, output_dir, bn, datetime.now(timezone.utc)); stats["batches"] = bn+1
+        day_key    = scraped_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_buckets.setdefault(day_key, []).append(build_price_record(scraped_at, dirty))
+        stats["records"] += 1
+
+    for day_dt, records in sorted(day_buckets.items()):
+        write_daily_file(records, output_dir, day_dt)
+        stats["files"] += 1
+
     elapsed = time.time() - t0
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
     log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
 def run_stream(output_dir, dirty=False):
     log.info(f"STREAM MODE | ~2K/day | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids(); stats, i = {"records":0}, 0
+    get_entity_ids(); stats, i = {"records": 0}, 0
     try:
         while True:
             i += 1; now = datetime.now(timezone.utc)
-            record = build_price_record(now, dirty)
-            write_batch([record], output_dir, i, now)
+            day_key = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            write_daily_file([build_price_record(now, dirty)], output_dir, day_key)
             stats["records"] += 1
             if i % 100 == 0: log.info(f"Stream — {stats}")
             time.sleep(STREAM_SLEEP)
