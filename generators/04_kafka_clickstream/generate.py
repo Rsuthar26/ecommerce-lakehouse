@@ -58,8 +58,8 @@ STREAM_SLEEP = 86400 / 500000  # Rule 6 + Rule 13: ~6 events/sec
 TOPIC        = "clickstream.events"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
-    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
+    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-west-1.amazonaws.com:9094,"
+    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 EVENT_TYPES     = ["page_view","page_view","page_view","product_view","product_view",

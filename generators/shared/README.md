@@ -37,7 +37,7 @@ shipped_order_id = random.choice(ids["shipped_order_ids"])
 ## Environment Variables
 
 ```
-PG_HOST=ecommerce-lakehouse-postgres.c9m24scg8pte.eu-north-1.rds.amazonaws.com
+PG_HOST=ecommerce-lakehouse-postgres.c9m24scg8pte.eu-west-1.rds.amazonaws.com
 PG_PORT=5432
 PG_DBNAME=ecommerce
 PG_USER=postgres_admin

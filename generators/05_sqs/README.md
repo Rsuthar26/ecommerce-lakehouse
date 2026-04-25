@@ -14,7 +14,7 @@ Order lifecycle notifications published to Kafka. ~5K messages/day. Simulates th
   "amount_pence": 4999,
   "currency": "GBP",
   "tracking_number": "JD123456789GB (shipped/delivered only)",
-  "sqs_queue_url": "https://sqs.eu-north-1.amazonaws.com/467091806172/order-events",
+  "sqs_queue_url": "https://sqs.eu-west-1.amazonaws.com/467091806172/order-events",
   "approximate_receive_count": 1
 }
 ```

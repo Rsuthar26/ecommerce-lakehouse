@@ -57,8 +57,8 @@ STREAM_SLEEP = 86400 / 5000   # Rule 6 + Rule 13: ~1 event per 17s
 TOPIC        = "order.events"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
-    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
+    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-west-1.amazonaws.com:9094,"
+    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 _entity_ids = None
@@ -165,7 +165,7 @@ def build_event(event_dt: datetime, dirty: bool = False,
         "source":        "sqs",
         "sqs_message_id":      str(uuid.uuid4()),
         "sqs_receipt_handle":  str(uuid.uuid4()),
-        "sqs_queue_url": "https://sqs.eu-north-1.amazonaws.com/467091806172/order-events",
+        "sqs_queue_url": "https://sqs.eu-west-1.amazonaws.com/467091806172/order-events",
         "approximate_receive_count": random.randint(1, 3),
     }
 

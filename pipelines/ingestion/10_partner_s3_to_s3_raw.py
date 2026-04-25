@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 RAW_BUCKET    = os.environ.get("S3_RAW_BUCKET", "ecommerce-lakehouse-467091806172-raw-01")
 SOURCE_PREFIX = "source=10_partner_s3"
 MANIFEST_KEY  = f"{SOURCE_PREFIX}/_metadata/uploaded_files.json"
-AWS_REGION    = os.environ.get("AWS_DEFAULT_REGION", "eu-north-1")
+AWS_REGION    = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
 
 CONTENT_TYPES = {
     ".parquet": "application/octet-stream",

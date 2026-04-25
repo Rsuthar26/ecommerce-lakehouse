@@ -9,15 +9,15 @@ Follow this guide top to bottom — each step depends on the one before it.
 
 | Layer | Service | Region |
 |---|---|---|
-| Source database | AWS RDS PostgreSQL db.t3.micro | eu-north-1 |
-| Raw landing zone | S3 ecommerce-lakehouse-{account}-raw-01 | eu-north-1 |
-| Bronze Delta tables | S3 ecommerce-lakehouse-{account}-bronze-01 | eu-north-1 |
-| Silver Delta tables | S3 ecommerce-lakehouse-{account}-silver-01 | eu-north-1 |
-| Gold Delta tables | S3 ecommerce-lakehouse-{account}-gold-01 | eu-north-1 |
-| Streaming broker | AWS MSK kafka.m5.large | eu-north-1 — spin up when needed |
-| CDC connector | Debezium on EC2 t3.small | eu-north-1 — spin up when needed |
-| Orchestration | Airflow MWAA | eu-north-1 — spin up when needed |
-| Compute | Databricks on AWS | eu-north-1 — next step |
+| Source database | AWS RDS PostgreSQL db.t3.micro | eu-west-1 |
+| Raw landing zone | S3 ecommerce-lakehouse-{account}-raw-01 | eu-west-1 |
+| Bronze Delta tables | S3 ecommerce-lakehouse-{account}-bronze-01 | eu-west-1 |
+| Silver Delta tables | S3 ecommerce-lakehouse-{account}-silver-01 | eu-west-1 |
+| Gold Delta tables | S3 ecommerce-lakehouse-{account}-gold-01 | eu-west-1 |
+| Streaming broker | AWS MSK kafka.m5.large | eu-west-1 — spin up when needed |
+| CDC connector | Debezium on EC2 t3.small | eu-west-1 — spin up when needed |
+| Orchestration | Airflow MWAA | eu-west-1 — spin up when needed |
+| Compute | Databricks on AWS | eu-west-1 — next step |
 
 > **Cost rule:** Only RDS and S3 run continuously. MSK, EC2, and MWAA are
 > provisioned before a session and destroyed after. This keeps idle cost near zero.
@@ -80,7 +80,7 @@ Takes ~5 minutes. Watch for `Creation complete`.
 aws rds describe-db-instances \
   --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceStatus]' \
   --output table \
-  --region eu-north-1
+  --region eu-west-1
 ```
 
 Expected: `staff-de-journey-postgres | available`
@@ -92,7 +92,7 @@ aws rds modify-db-instance \
   --db-instance-identifier staff-de-journey-postgres \
   --master-user-password "NewPassword123" \
   --apply-immediately \
-  --region eu-north-1
+  --region eu-west-1
 ```
 
 Password rules: 8+ characters, no `@` `/` `"` or spaces.
@@ -102,7 +102,7 @@ Password rules: 8+ characters, no `@` `/` `"` or spaces.
 ```bash
 aws rds stop-db-instance \
   --db-instance-identifier staff-de-journey-postgres \
-  --region eu-north-1
+  --region eu-west-1
 ```
 
 ### Key config decisions
@@ -113,7 +113,7 @@ aws rds stop-db-instance \
 | WAL level | logical | Required for Debezium CDC |
 | Public access | true (dev only) | Set false in production |
 | Encryption | true | Always on — costs nothing |
-| Region | eu-north-1 | Must match all other resources |
+| Region | eu-west-1 | Must match all other resources |
 
 ---
 
@@ -143,8 +143,8 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 for layer in raw-01 bronze-01 silver-01 gold-01; do
   aws s3api create-bucket \
     --bucket ecommerce-lakehouse-${ACCOUNT}-${layer} \
-    --region eu-north-1 \
-    --create-bucket-configuration LocationConstraint=eu-north-1
+    --region eu-west-1 \
+    --create-bucket-configuration LocationConstraint=eu-west-1
   echo "Created: ecommerce-lakehouse-${ACCOUNT}-${layer}"
 done
 ```
@@ -160,19 +160,19 @@ for layer in raw-01 bronze-01 silver-01 gold-01; do
   aws s3api put-bucket-versioning \
     --bucket $NAME \
     --versioning-configuration Status=Enabled \
-    --region eu-north-1
+    --region eu-west-1
 
   aws s3api put-bucket-encryption \
     --bucket $NAME \
     --server-side-encryption-configuration \
     '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
-    --region eu-north-1
+    --region eu-west-1
 
   aws s3api put-public-access-block \
     --bucket $NAME \
     --public-access-block-configuration \
     "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
-    --region eu-north-1
+    --region eu-west-1
 
   echo "✅ $NAME configured"
 done
@@ -181,7 +181,7 @@ done
 ### Verify
 
 ```bash
-aws s3 ls --region eu-north-1 | grep ecommerce-lakehouse
+aws s3 ls --region eu-west-1 | grep ecommerce-lakehouse
 ```
 
 Expected: 4 buckets listed with creation timestamps.
@@ -230,7 +230,7 @@ terraform destroy -target=aws_msk_cluster.main
 ```bash
 aws ec2 start-instances \
   --instance-ids i-042dbb1daaa085576 \
-  --region eu-north-1
+  --region eu-west-1
 ```
 
 ### SSH
@@ -256,7 +256,7 @@ curl -s -X POST http://localhost:8083/connectors \
 ```bash
 aws ec2 stop-instances \
   --instance-ids i-042dbb1daaa085576 \
-  --region eu-north-1
+  --region eu-west-1
 ```
 
 ---
@@ -276,7 +276,7 @@ To also delete S3 buckets:
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 for layer in raw-01 bronze-01 silver-01 gold-01; do
-  aws s3 rb s3://ecommerce-lakehouse-${ACCOUNT}-${layer} --force --region eu-north-1
+  aws s3 rb s3://ecommerce-lakehouse-${ACCOUNT}-${layer} --force --region eu-west-1
 done
 ```
 

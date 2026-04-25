@@ -35,7 +35,7 @@ pip install psycopg2-binary faker python-dotenv
 ## Environment Variables
 
 ```bash
-PG_HOST=ecommerce-lakehouse-postgres.c9m24scg8pte.eu-north-1.rds.amazonaws.com
+PG_HOST=ecommerce-lakehouse-postgres.c9m24scg8pte.eu-west-1.rds.amazonaws.com
 PG_PORT=5432
 PG_DBNAME=ecommerce
 PG_USER=postgres_admin
@@ -67,5 +67,5 @@ SELECT COUNT(*) FROM customers WHERE email NOT LIKE '%@%';
 ## Notes
 - Never run `--mode burst` twice — orders have no conflict guard. Burst is one-time setup only.
 - Stream mode is safe to run continuously — commits per order.
-- RDS must be running before starting: `aws rds start-db-instance --db-instance-identifier ecommerce-lakehouse-postgres --region eu-north-1`
+- RDS must be running before starting: `aws rds start-db-instance --db-instance-identifier ecommerce-lakehouse-postgres --region eu-west-1`
 - Stop RDS at end of every session to avoid unexpected charges.

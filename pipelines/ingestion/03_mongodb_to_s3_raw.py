@@ -65,7 +65,7 @@ log = logging.getLogger(__name__)
 RAW_BUCKET    = os.environ.get("S3_RAW_BUCKET", "ecommerce-lakehouse-467091806172-raw-01")
 SOURCE_PREFIX = "source=03_mongodb"
 WATERMARK_KEY = f"{SOURCE_PREFIX}/_metadata/watermark.json"
-AWS_REGION    = os.environ.get("AWS_DEFAULT_REGION", "eu-north-1")
+AWS_REGION    = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
 DB_NAME       = "ecommerce"
 
 COLLECTIONS = {

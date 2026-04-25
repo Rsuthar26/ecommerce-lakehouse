@@ -55,8 +55,8 @@ STREAM_SLEEP = 86400 / 43200  # Rule 13: 5 sensors × 8640 readings/day = 43,200
 TOPIC   = "iot.telemetry"
 BROKERS = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
-    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
+    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-west-1.amazonaws.com:9094,"
+    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 SENSORS = [

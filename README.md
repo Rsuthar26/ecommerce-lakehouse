@@ -123,7 +123,7 @@ Total cost per demo session: approximately $2–3.
 |---|---|
 | All 18 data generators | ✅ Complete |
 | AWS infrastructure (Terraform) | ✅ Complete — RDS, MSK, EC2, S3 |
-| S3 Raw Landing Zone | ✅ Complete — eu-north-1 |
+| S3 Raw Landing Zone | ✅ Complete — eu-west-1 |
 | Bronze ingestion pipelines | 🔄 In progress |
 | Silver cleaning layer | ⬜ Pending |
 | Gold analytics layer | ⬜ Pending |
