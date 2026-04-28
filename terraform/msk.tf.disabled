@@ -32,7 +32,7 @@ resource "aws_cloudwatch_log_group" "msk" {
 resource "aws_security_group" "msk" {
   name        = "${var.project_name}-msk-sg"
   description = "Controls access to MSK Kafka brokers"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.default.id
 
   # Kafka plaintext port
   ingress {
@@ -67,7 +67,7 @@ resource "aws_security_group" "msk" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = [aws_vpc.main.cidr_block]
+    cidr_blocks = [data.aws_vpc.default.cidr_block]
   }
 
   egress {
@@ -111,7 +111,7 @@ resource "aws_msk_cluster" "main" {
 
     # Use only one subnet for single broker
     # Must match number_of_broker_nodes
-    client_subnets  = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+    client_subnets  = data.aws_subnets.default.ids
     security_groups = [aws_security_group.msk.id]
 
     connectivity_info {
