@@ -8,7 +8,7 @@
 variable "aws_region" {
   description = "AWS region for all resources"
   type        = string
-  default     = "eu-north-1" # London — change to your nearest region
+  default     = "eu-west-1" # London — change to your nearest region
 }
 
 variable "project_name" {
