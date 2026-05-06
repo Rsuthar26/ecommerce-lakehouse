@@ -124,7 +124,7 @@ resource "aws_msk_cluster" "main" {
 
     connectivity_info {
       public_access {
-        type = "SERVICE_PROVIDED_EIPS"
+        type = "DISABLED"
       }
     }
 
@@ -211,8 +211,9 @@ output "msk_cluster_arn" {
 
 # ── MSK SCRAM credentials in Secrets Manager ─────────────────
 resource "aws_secretsmanager_secret" "msk_scram" {
+  kms_key_id = aws_kms_key.msk_scram.key_id
   name       = "AmazonMSK_ecommerce-lakehouse-kafka-scram"
-  kms_key_id = "alias/aws/secretsmanager"
+  
   tags       = { Name = "${var.project_name}-msk-scram" }
 }
 
@@ -237,4 +238,10 @@ output "msk_kafka_username" {
 output "msk_kafka_password" {
   value     = "KafkaAdmin2026!"
   sensitive = true
+}
+
+resource "aws_kms_key" "msk_scram" {
+  description             = "KMS key for MSK SCRAM credentials"
+  deletion_window_in_days = 7
+  tags                    = { Name = "${var.project_name}-msk-scram-key" }
 }
