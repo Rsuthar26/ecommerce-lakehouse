@@ -57,8 +57,8 @@ STREAM_SLEEP = 86400 / 5000   # Rule 6 + Rule 13: ~1 event per 17s
 TOPIC        = "order.events"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.ecommercelakehousekafk.uiaw32.c2.kafka.eu-west-1.amazonaws.com:9094,"
-    "b-2.ecommercelakehousekafk.uiaw32.c2.kafka.eu-west-1.amazonaws.com:9094,b-3.ecommercelakehousekafk.uiaw32.c2.kafka.eu-west-1.amazonaws.com:9094"
+    "b-1.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,"
+    "b-2.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,b-3.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 _entity_ids = None
