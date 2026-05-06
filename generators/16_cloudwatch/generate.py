@@ -17,7 +17,21 @@ from kafka.errors import KafkaError
 from faker import Faker
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from generators.shared.postgres_ids import load_entity_ids
+
 load_dotenv()
+
+_entity_ids = None
+def get_entity_ids():
+    global _entity_ids
+    if _entity_ids is None:
+        try:
+            _entity_ids = load_entity_ids()
+        except Exception as e:
+            log.warning(f"Postgres unavailable ({e}) — order_id in logs will be skipped")
+            _entity_ids = {"order_ids": []}
+    return _entity_ids
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 fake = Faker("en_GB"); Faker.seed(42)
@@ -26,8 +40,8 @@ STREAM_SLEEP = 86400 / 50000   # Rule 6 + Rule 13
 TOPIC        = "app.logs"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,"
-    "b-2.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,b-3.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094"
+    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
+    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
 )
 
 LOG_LEVELS  = ["INFO","INFO","INFO","INFO","WARN","ERROR","DEBUG"]
@@ -54,6 +68,7 @@ def maybe_null(v, dirty, base=0.05, elev=0.20):
 
 def build_log_event(event_dt: datetime, dirty: bool = False,
                     burst_seq: int = None) -> dict:
+    ids       = get_entity_ids()
     source    = random.choice(LOG_SOURCES)
     log_level = random.choice(LOG_LEVELS)
 
@@ -65,7 +80,14 @@ def build_log_event(event_dt: datetime, dirty: bool = False,
         latency = random.randint(5, 5000)
         message = f"{path} {status} {latency}ms"
     else:
-        message = f"Processing {random.choice(['order','payment','inventory'])} event {str(uuid.uuid4())[:8]}"
+        # Silver extracts order_id via regex: r'order #(\d+)'
+        # Must use this exact format — Silver regex depends on it
+        event_ref = random.choice(['order', 'payment', 'inventory'])
+        if event_ref == 'order' and ids.get("order_ids"):
+            order_id = random.choice(ids["order_ids"])
+            message = f"Processing order #{order_id} event {str(uuid.uuid4())[:8]}"
+        else:
+            message = f"Processing {event_ref} event {str(uuid.uuid4())[:8]}"
 
     # Rule 5: deterministic log_id in burst mode
     if burst_seq is not None:
@@ -86,7 +108,7 @@ def build_log_event(event_dt: datetime, dirty: bool = False,
         "message":       maybe_null(message, dirty),
         "request_id":    str(uuid.uuid4()),
         "trace_id":      maybe_null(str(uuid.uuid4()), dirty),
-        "aws_region":    "eu-west-1",
+        "aws_region":    "eu-north-1",
         "log_group":     f"/aws/{source}",
         "log_stream":    f"{source}-{event_dt.strftime('%Y/%m/%d')}",
         "account_id":    "467091806172",
@@ -120,6 +142,7 @@ def get_producer():
 
 def run_burst(days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
+    get_entity_ids()
     t0, producer = time.time(), get_producer()
     stats, total, now = {"sent":0,"errors":0}, days * 5000, datetime.now(timezone.utc)
     for i in range(total):
@@ -137,6 +160,7 @@ def run_burst(days=7, dirty=False):
 
 def run_stream(dirty=False):
     log.info(f"STREAM MODE | ~50K/day | dirty={dirty} | Ctrl+C to stop")
+    get_entity_ids()
     producer, stats, i = get_producer(), {"sent":0}, 0
     try:
         while True:

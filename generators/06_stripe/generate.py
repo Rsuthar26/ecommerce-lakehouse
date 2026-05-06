@@ -178,9 +178,9 @@ def build_stripe_charge(created_at: datetime, dirty: bool = False) -> dict:
 
         # Metadata — joins back to our order
         "metadata": {
-            "order_id":   maybe_null(str(order_id), dirty, base=0.01),
+            "order_id":    maybe_null(str(order_id), dirty, base=0.01),
             "customer_id": maybe_null(
-                str(random.choice(ids["customer_ids"])) if ids["customer_ids"] else None,
+                str(ids["order_customers"].get(order_id)) if ids["order_customers"].get(order_id) else None,
                 dirty
             ),
         },
@@ -283,7 +283,7 @@ def write_hour_file(charges: list, output_dir: Path, hour_dt: datetime) -> None:
 
 def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    get_payment_rows()
+    get_payment_rows(); get_entity_ids()
     t0    = time.time()
     stats = {"charges": 0, "files": 0}
     now   = datetime.now(timezone.utc)
@@ -322,7 +322,7 @@ def run_burst(output_dir: Path, days: int = 7, dirty: bool = False):
 
 def run_stream(output_dir: Path, dirty: bool = False):
     log.info(f"STREAM MODE | ~10K/day | dirty={dirty} | Ctrl+C to stop")
-    get_payment_rows()
+    get_payment_rows(); get_entity_ids()
     stats, i = {"charges": 0}, 0
     try:
         while True:

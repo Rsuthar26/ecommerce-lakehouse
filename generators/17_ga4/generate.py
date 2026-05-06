@@ -116,6 +116,10 @@ def build_ga4_event(event_dt: datetime, dirty: bool = False) -> dict:
     if dirty and random.random() < 0.02:
         ts_micros = int(datetime(2099,1,1,tzinfo=timezone.utc).timestamp() * 1_000_000)
 
+    # Session stitching: user_pseudo_id derived from customer_id
+    # Gold joins GA4.user_pseudo_id to Clickstream.user_id via shared customer_id
+    cid = random.choice(ids["customer_ids"]) if ids["customer_ids"] else random.randint(1, 50000)
+
     return {
         "event_date":      event_dt.strftime("%Y%m%d"),
         "event_timestamp": ts_micros,
@@ -123,7 +127,7 @@ def build_ga4_event(event_dt: datetime, dirty: bool = False) -> dict:
         "event_value_in_usd": maybe_null(round(random.uniform(0,500),2), dirty, base=0.70, elev=0.80),
         "event_bundle_sequence_id": random.randint(1,1000),
         "user_id":         maybe_null(None, dirty, base=0.70, elev=0.80),
-        "user_pseudo_id":  maybe_null(hashlib.md5(f"user_{random.randint(1,50000)}".encode()).hexdigest()[:20], dirty),
+        "user_pseudo_id":  maybe_null(hashlib.md5(f"user_{cid}".encode()).hexdigest()[:20], dirty),
         "user_ltv":        {"revenue": maybe_null(round(random.uniform(0,1000),2),dirty), "currency":"GBP"},
         "device": {
             "category":           device,

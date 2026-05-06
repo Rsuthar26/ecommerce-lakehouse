@@ -60,7 +60,7 @@ fake = Faker("en_GB")
 Faker.seed(42)
 
 STREAM_SLEEP = 86400 / 10000  # Rule 6 + Rule 13: ~10K updates/day
-MONGO_URI    = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_URI    = os.environ.get("MONGO_URI", "mongodb+srv://mongo_admin:MongoAdmin2026!@ecommerce-cluster.k2gc71w.mongodb.net/")
 DB_NAME      = os.environ.get("MONGO_DBNAME", "ecommerce")
 COLLECTION   = "products"
 HISTORY_COL  = "product_price_history"

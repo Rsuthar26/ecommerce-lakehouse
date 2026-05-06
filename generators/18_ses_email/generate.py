@@ -37,7 +37,7 @@ EMAIL_TYPES = [
 ]
 BOUNCE_TYPES    = ["Permanent","Transient"]
 COMPLAINT_TYPES = ["abuse","auth-failure","fraud","not-spam","other"]
-SES_REGIONS     = ["eu-west-1","eu-north-1"]
+SES_REGIONS     = ["eu-west-1"]
 
 _entity_ids = None
 def get_entity_ids():
