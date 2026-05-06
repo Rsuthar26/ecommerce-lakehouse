@@ -26,8 +26,8 @@ STREAM_SLEEP = 86400 / 50000   # Rule 6 + Rule 13
 TOPIC        = "app.logs"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
-    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
+    "b-1.ecommercelakehousekafk.uiaw32.c2.kafka.eu-west-1.amazonaws.com:9094,"
+    "b-2.ecommercelakehousekafk.uiaw32.c2.kafka.eu-west-1.amazonaws.com:9094,b-3.ecommercelakehousekafk.uiaw32.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 LOG_LEVELS  = ["INFO","INFO","INFO","INFO","WARN","ERROR","DEBUG"]
