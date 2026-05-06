@@ -58,7 +58,7 @@ TOPIC        = "order.events"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
     "b-1.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,"
-    "b-2.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,b-3.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094"
+    "b-2.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 _entity_ids = None
@@ -140,9 +140,11 @@ def build_event(event_dt: datetime, dirty: bool = False,
                 burst_seq: int = None) -> dict:
     ids        = get_entity_ids()
     event_type = event_type_for_age(event_dt)          # Rule 4
-    order_id   = random.choice(ids["order_ids"]) if ids["order_ids"] else None  # Rule 11
-    customer_id = random.choice(ids["customer_ids"]) if ids["customer_ids"] else None  # Rule 11
-    amount_pence = random.randint(999, 99999)
+    order_id   = random.choice(ids["order_ids"]) if ids["order_ids"] else None
+
+    # Cross-field integrity: customer and amount must come from the same order row
+    customer_id  = ids["order_customers"].get(order_id)
+    amount_pence = ids["order_amounts"].get(order_id, random.randint(999, 99999))  # Rule 14
 
     # Rule 5: deterministic message_id in burst mode
     if burst_seq is not None:

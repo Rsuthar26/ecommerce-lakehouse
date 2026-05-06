@@ -54,12 +54,39 @@ log = logging.getLogger(__name__)
 fake = Faker("en_GB")
 Faker.seed(42)
 
+# MongoDB product prices — product_price must match catalog (Sources 03, 08, 09, 14)
+_mongo_prices: dict = {}
+
+def load_mongo_prices() -> dict:
+    global _mongo_prices
+    if _mongo_prices:
+        return _mongo_prices
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(
+            os.environ.get("MONGO_URI",
+                "mongodb+srv://mongo_admin:MongoAdmin2026!@ecommerce-cluster.k2gc71w.mongodb.net/"),
+            serverSelectionTimeoutMS=5000
+        )
+        cursor = client["ecommerce"]["products"].find(
+            {"base_price_pence": {"$exists": True, "$gt": 0}},
+            {"product_sku": 1, "base_price_pence": 1, "_id": 0}
+        )
+        _mongo_prices = {doc["product_sku"]: doc["base_price_pence"] for doc in cursor
+                         if doc.get("product_sku") and doc.get("base_price_pence")}
+        client.close()
+        log.info(f"Loaded {len(_mongo_prices)} product prices from MongoDB")
+    except Exception as e:
+        log.warning(f"MongoDB unavailable ({e}) — product_price will use random fallback")
+        _mongo_prices = {}
+    return _mongo_prices
+
 STREAM_SLEEP = 86400 / 500000  # Rule 6 + Rule 13: ~6 events/sec
 TOPIC        = "clickstream.events"
 BROKERS      = os.environ.get(
     "KAFKA_BOOTSTRAP_SERVERS",
     "b-1.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,"
-    "b-2.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094,b-3.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094"
+    "b-2.ecommercelakehousekafk.54uzsu.c2.kafka.eu-west-1.amazonaws.com:9094"
 )
 
 EVENT_TYPES     = ["page_view","page_view","page_view","product_view","product_view",
@@ -119,7 +146,8 @@ def build_event(event_dt: datetime, dirty: bool = False,
     event_type = random.choice(EVENT_TYPES)
     session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"session_{random.randint(1,10000)}"))
     sku        = random.choice(ids["product_skus"])
-    price      = round(random.uniform(4.99, 299.99), 2)
+    # Product price from MongoDB catalog — consistent with Sources 03, 08, 09, 14
+    price      = load_mongo_prices().get(sku, random.randint(499, 29999)) / 100
 
     # Rule 5: deterministic event_id in burst mode
     if burst_seq is not None:
@@ -134,7 +162,7 @@ def build_event(event_dt: datetime, dirty: bool = False,
         "event_type":     event_type,
         "event_ts":       event_dt.isoformat(),
         "session_id":     maybe_null(session_id, dirty),
-        "user_id":        maybe_null(                         # Rule 11
+        "user_id":        maybe_null(
             random.choice(ids["customer_ids"]) if ids["customer_ids"] else None,
             dirty, base=0.30, elev=0.50),
         "anonymous_id":   str(uuid.uuid4()),
@@ -156,11 +184,14 @@ def build_event(event_dt: datetime, dirty: bool = False,
             random.choice(["headphones","keyboard","desk lamp","webcam"]), dirty)
 
     if event_type == "purchase":
-        # Rule 11: real order_id from Postgres
-        event["order_id"] = maybe_null(
-            random.choice(ids["order_ids"]) if ids["order_ids"] else None, dirty)
-        event["revenue"]  = maybe_null(price, dirty)
-        event["currency"] = "GBP"
+        # Cross-field integrity: pick order_id then get matching customer and amount
+        order_id    = random.choice(ids["order_ids"]) if ids["order_ids"] else None
+        user_id     = ids["order_customers"].get(order_id)
+        revenue_p   = ids["order_amounts"].get(order_id, random.randint(999, 99999))
+        event["order_id"]  = maybe_null(order_id, dirty)
+        event["user_id"]   = maybe_null(user_id, dirty, base=0.30, elev=0.50)
+        event["revenue"]   = maybe_null(revenue_p / 100, dirty)
+        event["currency"]  = "GBP"
 
     # Dirty: 1% malformed (missing required field)
     if dirty and random.random() < 0.01:
@@ -194,8 +225,8 @@ def get_producer() -> KafkaProducer:
 
 def run_burst(days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
-    # Rule 11: load real IDs before generating
-    get_entity_ids()
+    # Rule 11: load real IDs and prices before generating
+    get_entity_ids(); load_mongo_prices()
     t0       = time.time()
     producer = get_producer()
     stats    = {"sent": 0, "errors": 0}
@@ -232,7 +263,7 @@ def run_burst(days: int = 7, dirty: bool = False):
 
 def run_stream(dirty: bool = False):
     log.info(f"STREAM MODE | ~6 events/sec | dirty={dirty} | Ctrl+C to stop")
-    get_entity_ids()
+    get_entity_ids(); load_mongo_prices()
     producer = get_producer()
     stats, i = {"sent": 0, "errors": 0}, 0
     try:
