@@ -70,6 +70,14 @@ resource "aws_security_group" "msk" {
     cidr_blocks = [data.aws_vpc.default.cidr_block]
   }
 
+  ingress {
+    description = "Kafka SASL/IAM public port"
+    from_port   = 9098
+    to_port     = 9098
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -116,7 +124,7 @@ resource "aws_msk_cluster" "main" {
 
     connectivity_info {
       public_access {
-        type = "DISABLED"
+        type = "SERVICE_PROVIDED_EIPS"
       }
     }
 
@@ -138,7 +146,9 @@ resource "aws_msk_cluster" "main" {
   # Client authentication — none for dev
   # Production: use SASL/SCRAM or mutual TLS
   client_authentication {
-    unauthenticated = true
+    sasl {
+      scram = true
+    }
   }
 
   # Kafka configuration
@@ -197,4 +207,34 @@ output "msk_zookeeper_connect" {
 output "msk_cluster_arn" {
   description = "MSK cluster ARN"
   value       = aws_msk_cluster.main.arn
+}
+
+# ── MSK SCRAM credentials in Secrets Manager ─────────────────
+resource "aws_secretsmanager_secret" "msk_scram" {
+  name       = "AmazonMSK_ecommerce-lakehouse-kafka-scram"
+  kms_key_id = "alias/aws/secretsmanager"
+  tags       = { Name = "${var.project_name}-msk-scram" }
+}
+
+resource "aws_secretsmanager_secret_version" "msk_scram" {
+  secret_id     = aws_secretsmanager_secret.msk_scram.id
+  secret_string = jsonencode({
+    username = "kafka-admin"
+    password = "KafkaAdmin2026!"
+  })
+}
+
+resource "aws_msk_scram_secret_association" "main" {
+  cluster_arn     = aws_msk_cluster.main.arn
+  secret_arn_list = [aws_secretsmanager_secret.msk_scram.arn]
+  depends_on      = [aws_secretsmanager_secret_version.msk_scram]
+}
+
+output "msk_kafka_username" {
+  value = "kafka-admin"
+}
+
+output "msk_kafka_password" {
+  value     = "KafkaAdmin2026!"
+  sensitive = true
 }

@@ -132,7 +132,7 @@ def build_event(sensor: dict, event_dt: datetime,
 def get_producer():
     return KafkaProducer(
         bootstrap_servers=BROKERS.split(","),
-        security_protocol="SSL",
+        security_protocol="SASL_SSL", sasl_mechanism="SCRAM-SHA-512", sasl_plain_username=os.environ.get("KAFKA_USERNAME","kafka-admin"), sasl_plain_password=os.environ.get("KAFKA_PASSWORD","KafkaAdmin2026!"),
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
         acks="all", retries=3, linger_ms=5,
