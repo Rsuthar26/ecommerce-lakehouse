@@ -59,7 +59,7 @@ _mongo_prices: dict = {}
 
 def load_mongo_prices() -> dict:
     global _mongo_prices
-    if _mongo_prices:
+    if _mongo_prices is not None:
         return _mongo_prices
     try:
         from pymongo import MongoClient
