@@ -62,7 +62,7 @@ resource "aws_instance" "debezium" {
     volume_size = 30
     volume_type = "gp3"
   } # Kafka Connect needs ~1GB RAM minimum
-  key_name                    = var.ec2_key_name
+  key_name                    = "ecommerce-lakehouse-key"
   subnet_id                   = tolist(data.aws_subnets.default.ids)[0]
   vpc_security_group_ids      = [aws_security_group.debezium.id]
   associate_public_ip_address = true # Need public IP to SSH from your Mac
@@ -112,12 +112,4 @@ output "ssh_command" {
   value       = "ssh -i ~/.ssh/staff-de-journey-key.pem ec2-user@${aws_instance.debezium.public_ip}"
 }
 
-resource "aws_eip_association" "debezium" {
-  instance_id   = aws_instance.debezium.id
-  allocation_id = "eipalloc-0ca6709d9686a9e78"
-}
 
-output "debezium_elastic_ip" {
-  value = "56.228.75.74"
-  description = "Permanent static IP for EC2 Debezium host"
-}
