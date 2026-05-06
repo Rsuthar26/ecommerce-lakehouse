@@ -73,6 +73,14 @@ resource "aws_security_group" "rds" {
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
+    description = "PostgreSQL from VPC internal"
+    from_port   = var.db_port
+    to_port     = var.db_port
+    protocol    = "tcp"
+    cidr_blocks = [data.aws_vpc.default.cidr_block]
+  }
+
+  ingress {
     description = "PostgreSQL from allowed CIDRs"
     from_port   = var.db_port
     to_port     = var.db_port
