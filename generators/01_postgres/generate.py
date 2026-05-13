@@ -329,11 +329,26 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
 # BURST MODE
 # ─────────────────────────────────────────────────────────────
 
-def run_burst(days: int = 7, dirty: bool = False):
-    log.info(f"BURST MODE | days={days} | dirty={dirty}")
+def run_burst(days: int = 7, dirty: bool = False, force: bool = False):
+    log.info(f"BURST MODE | days={days} | dirty={dirty} | force={force}")
     t0   = time.time()
     conn = get_conn()
     cur  = conn.cursor()
+
+    # Rule 5 — Idempotency guard for orders
+    # orders use BIGSERIAL — ON CONFLICT DO NOTHING cannot be used with RETURNING.
+    # Instead: check if orders already exist and skip if so (unless --force).
+    cur.execute("SELECT COUNT(*) FROM orders")
+    existing_orders = cur.fetchone()[0]
+    if existing_orders > 0 and not force:
+        log.warning(
+            f"Orders table already has {existing_orders} rows. "
+            f"Skipping burst to prevent duplicates. "
+            f"Use --force to override (will add more orders on top of existing data)."
+        )
+        cur.close()
+        conn.close()
+        return
 
     log.info("Creating schema...")
     create_schema(cur)
@@ -410,10 +425,12 @@ def main():
     p.add_argument("--mode",  choices=["burst", "stream"], required=True)
     p.add_argument("--days",  type=int, default=7)
     p.add_argument("--dirty", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="Override idempotency guard — adds orders on top of existing data")
     args = p.parse_args()
-    log.info(f"Source 01 | mode={args.mode} | days={args.days} | dirty={args.dirty}")
+    log.info(f"Source 01 | mode={args.mode} | days={args.days} | dirty={args.dirty} | force={args.force}")
     if args.mode == "burst":
-        run_burst(args.days, args.dirty)
+        run_burst(args.days, args.dirty, args.force)
     elif args.mode == "stream":
         run_stream(args.dirty)
 
