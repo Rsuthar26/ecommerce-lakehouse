@@ -85,7 +85,12 @@ exec > /var/log/user-data.log 2>&1
 curl -fsSL https://raw.githubusercontent.com/Rsuthar26/ecommerce-lakehouse/main/scripts/setup_kafka_connect.sh \
   -o /tmp/setup_kafka_connect.sh
 chmod +x /tmp/setup_kafka_connect.sh
-bash /tmp/setup_kafka_connect.sh ${aws_msk_cluster.main.arn}
+# Retry up to 3 times — handles transient GitHub/Confluent Hub failures
+for i in 1 2 3; do
+  bash /tmp/setup_kafka_connect.sh ${aws_msk_cluster.main.arn} && break
+  echo "Attempt $i failed, retrying in 30s..."
+  sleep 30
+done
 
   EOF
 
