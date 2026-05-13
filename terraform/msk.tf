@@ -52,6 +52,15 @@ resource "aws_security_group" "msk" {
     cidr_blocks = var.allowed_cidr_blocks
   }
 
+  # Kafka SASL/SCRAM port (port 9096)
+  ingress {
+    description = "Kafka SASL/SCRAM from allowed CIDRs"
+    from_port   = 9096
+    to_port     = 9096
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+  }
+
   # Zookeeper port (needed for older Kafka clients)
   ingress {
     description = "Zookeeper from allowed CIDRs"
