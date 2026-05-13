@@ -53,11 +53,7 @@ log = logging.getLogger(__name__)
 STREAM_SLEEP = 86400 / 43200  # Rule 13: 5 sensors × 8640 readings/day = 43,200/day — 10s per round
 
 TOPIC   = "iot.telemetry"
-BROKERS = os.environ.get(
-    "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.ecommercelakehousekafk.uwewke.c2.kafka.eu-west-1.amazonaws.com:9096,"
-    "b-2.ecommercelakehousekafk.uwewke.c2.kafka.eu-west-1.amazonaws.com:9096,b-3.ecommercelakehousekafk.uwewke.c2.kafka.eu-west-1.amazonaws.com:9096"
-)
+BROKERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", os.environ.get("KAFKA_BROKERS", ""))
 
 SENSORS = [
     {"id": "SENSOR-WH-LON-TEMP-01", "warehouse": "WH-LONDON-01", "type": "temperature"},

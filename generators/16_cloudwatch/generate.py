@@ -38,11 +38,7 @@ fake = Faker("en_GB"); Faker.seed(42)
 
 STREAM_SLEEP = 86400 / 50000   # Rule 6 + Rule 13
 TOPIC        = "app.logs"
-BROKERS      = os.environ.get(
-    "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.ecommercelakehousekafk.uwewke.c2.kafka.eu-west-1.amazonaws.com:9096,"
-    "b-2.ecommercelakehousekafk.uwewke.c2.kafka.eu-west-1.amazonaws.com:9096,b-3.ecommercelakehousekafk.uwewke.c2.kafka.eu-west-1.amazonaws.com:9096"
-)
+BROKERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", os.environ.get("KAFKA_BROKERS", ""))
 
 LOG_LEVELS  = ["INFO","INFO","INFO","INFO","WARN","ERROR","DEBUG"]
 LOG_SOURCES = ["api-gateway","order-service","payment-service",
