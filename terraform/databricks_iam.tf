@@ -169,3 +169,24 @@ output "databricks_root_bucket" {
   value       = aws_s3_bucket.databricks_root.bucket
   description = "S3 bucket used as Databricks workspace root storage"
 }
+
+# ── Kafka permissions for EC2 (Debezium + Kafka Connect) ──
+resource "aws_iam_role_policy" "ec2_kafka_access" {
+  name = "ec2-kafka-access"
+  role = aws_iam_role.databricks_instance_profile.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "kafka:GetBootstrapBrokers",
+          "kafka:DescribeCluster",
+          "kafka:ListClusters"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
