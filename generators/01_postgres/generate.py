@@ -245,8 +245,9 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
         customer_id,
         dirty_status(order_status, ORDER_STATUSES, dirty),
         random.choice(CHANNELS),
-        dirty_amount(random.randint(0, 500), dirty),
-        shipping_pence,
+        0,              # total_amount_pence — computed and set by UPDATE after items
+        0,              # discount_amount_pence — computed from item discounts by UPDATE
+        shipping_pence, # shipping_amount_pence — known upfront
         "GBP",
         maybe_null(fake.street_address(), dirty),
         maybe_null(fake.city(), dirty),
@@ -258,7 +259,9 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
     order_id = cur.fetchone()[0]
 
     # Order items (1-4)
-    total_pence = shipping_pence
+    # Track subtotal and discount separately so total_amount_pence is correct
+    subtotal_pence = 0
+    discount_pence = 0
     num_items   = random.randint(1, 4)
     cur.execute(
         "SELECT product_sku FROM inventory ORDER BY RANDOM() LIMIT %s", (num_items,)
@@ -269,7 +272,8 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
         qty         = random.randint(1, 3)
         unit_pence  = random.randint(499, 14999)
         disc_pence  = int(unit_pence * random.uniform(0, 0.2)) if random.random() < 0.15 else 0
-        total_pence += (unit_pence - disc_pence) * qty
+        subtotal_pence += unit_pence * qty
+        discount_pence += disc_pence * qty
 
         cur.execute("""
             INSERT INTO order_items
@@ -295,11 +299,20 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
             WHERE product_sku = %s
         """, (qty, qty, sku))
 
-    # Update order total
-    cur.execute(
-        "UPDATE orders SET total_amount_pence=%s WHERE order_id=%s",
-        (total_pence, order_id)
-    )
+    # Compute total correctly:
+    # total_amount_pence = subtotal - discount + tax + shipping
+    # tax_pence = 20% VAT on net (subtotal - discount) — UK standard rate
+    net_pence           = subtotal_pence - discount_pence
+    tax_pence           = int(net_pence * 0.20)
+    total_amount_pence  = net_pence + tax_pence + shipping_pence
+
+    cur.execute("""
+        UPDATE orders
+        SET total_amount_pence    = %s,
+            discount_amount_pence = %s,
+            shipping_amount_pence = %s
+        WHERE order_id = %s
+    """, (total_amount_pence, discount_pence, shipping_pence, order_id))
 
     # Payment
     payment_status = payment_status_for_order_status(order_status)

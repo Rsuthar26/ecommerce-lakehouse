@@ -38,7 +38,11 @@ fake = Faker("en_GB"); Faker.seed(42)
 
 STREAM_SLEEP = 86400 / 50000   # Rule 6 + Rule 13
 TOPIC        = "app.logs"
-BROKERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", os.environ.get("KAFKA_BROKERS", ""))
+BROKERS      = os.environ.get(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
+    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
+)
 
 LOG_LEVELS  = ["INFO","INFO","INFO","INFO","WARN","ERROR","DEBUG"]
 LOG_SOURCES = ["api-gateway","order-service","payment-service",
@@ -104,7 +108,7 @@ def build_log_event(event_dt: datetime, dirty: bool = False,
         "message":       maybe_null(message, dirty),
         "request_id":    str(uuid.uuid4()),
         "trace_id":      maybe_null(str(uuid.uuid4()), dirty),
-        "aws_region":    "eu-north-1",
+        "aws_region":    "eu-west-1",
         "log_group":     f"/aws/{source}",
         "log_stream":    f"{source}-{event_dt.strftime('%Y/%m/%d')}",
         "account_id":    "467091806172",
@@ -130,7 +134,7 @@ def build_log_event(event_dt: datetime, dirty: bool = False,
 
 def get_producer():
     return KafkaProducer(
-        bootstrap_servers=BROKERS.split(","), security_protocol="SASL_SSL", sasl_mechanism="SCRAM-SHA-512", sasl_plain_username=os.environ.get("KAFKA_USERNAME","kafka-admin"), sasl_plain_password=os.environ.get("KAFKA_PASSWORD","KafkaAdmin2026!"),
+        bootstrap_servers=BROKERS.split(","), security_protocol="SSL",
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
         acks=1, retries=3, batch_size=32768, linger_ms=50, compression_type="gzip",

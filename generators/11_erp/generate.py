@@ -37,28 +37,45 @@ def dr(base, dirty, elevated): return elevated if dirty else base
 def maybe_null(v, dirty, base=0.05, elev=0.20):
     return None if random.random() < dr(base, dirty, elev) else v
 
+VENDORS = [
+    {"id": "VEND-101", "name": "Acme Supplies Ltd"},
+    {"id": "VEND-102", "name": "Global Wholesale Ltd"},
+    {"id": "VEND-103", "name": "TechParts Direct"},
+    {"id": "VEND-104", "name": "Premier Distribution Co"},
+    {"id": "VEND-105", "name": "FastTrack Logistics Ltd"},
+]
+
 def build_invoice(created_at: datetime, dirty: bool = False) -> dict:
     ids      = get_entity_ids()
     order_id = random.choice(ids["order_ids"]) if ids["order_ids"] else None
 
     # Rule 14: amount must come from Postgres when order_id is present
-    amount   = ids["order_amounts"].get(order_id, random.randint(1000, 50000))
+    subtotal = ids["order_amounts"].get(order_id, random.randint(1000, 50000))
+    # Ensure subtotal is always a positive int — Source 01 bug previously stored 0s
+    if not subtotal or subtotal <= 0:
+        subtotal = random.randint(1000, 50000)
+
+    # Explicit computation — total_pence = subtotal_pence + tax_pence
+    tax_pence   = int(subtotal * 0.20)
+    total_pence = subtotal + tax_pence   # never derived from amount * 1.20 directly
+
     inv_num  = f"INV-{hashlib.md5(f'{order_id}_{created_at.date()}'.encode()).hexdigest()[:8].upper()}"
     status   = "paid" if (datetime.now(timezone.utc) - created_at).days > 30 else random.choice(["issued","overdue","paid"])
+    vendor   = random.choice(VENDORS)  # always populated — real vendor list, never null
     return {
         "invoice_number": inv_num,
         "order_id":       maybe_null(order_id, dirty, base=0.01),
         "invoice_date":   created_at.isoformat(),
         "due_date":       (created_at + timedelta(days=30)).isoformat(),
         "status":         status,
-        "subtotal_pence": amount,
-        "tax_pence":      int(amount * 0.20),
-        "total_pence":    int(amount * 1.20),
+        "subtotal_pence": subtotal,
+        "tax_pence":      tax_pence,
+        "total_pence":    total_pence,   # always subtotal_pence + tax_pence
         "currency":       random.choice(CURRENCIES),
         "gl_account":     maybe_null(random.choice(GL_ACCOUNTS), dirty),
         "cost_centre":    maybe_null(random.choice(COST_CENTRES), dirty),
-        "vendor_id":      maybe_null(f"VEND-{random.randint(100,999)}", dirty),
-        "vendor_name":    maybe_null(fake.company(), dirty),
+        "vendor_id":      vendor["id"],    # always populated
+        "vendor_name":    vendor["name"],  # always populated
         "payment_terms":  maybe_null(random.choice(["NET30","NET60","NET90","immediate"]), dirty),
         "_source":        "erp_export",
         "_format":        "json",

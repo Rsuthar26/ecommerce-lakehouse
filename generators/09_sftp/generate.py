@@ -4,14 +4,11 @@ generators/09_sftp/generate.py — Staff DE Journey: Source 09
 Simulates supplier catalog and pricing files dropped via SFTP.
 Generates CSV and Excel files that look like real supplier data feeds.
 
-Fix applied: Rule 11 — real product SKUs loaded from Postgres at startup.
-
 Rules satisfied: All 11.
-
-Usage:
-    python generate.py --mode burst --output-dir /tmp/sftp_raw
-    python generate.py --mode burst --dirty --output-dir /tmp/sftp_raw
-    python generate.py --mode stream --output-dir /tmp/sftp_raw
+Fix applied:
+  - lead_days range 3-21 (realistic supplier lead times)
+  - rrp_gbp added to CSV rows from MongoDB base_price_pence (was missing entirely)
+  - supplier cost (unit_cost_gbp) always 35-65% of rrp_gbp
 """
 
 import os, sys, csv, json, time, random, logging, argparse, io
@@ -30,9 +27,9 @@ log = logging.getLogger(__name__)
 fake = Faker("en_GB"); Faker.seed(42)
 
 # ─────────────────────────────────────────────────────────────
-# MONGODB PRICE CACHE — supplier cost must be below retail price
-# Supplier cost = 35-65% of our MongoDB base_price_pence.
-# Never random — a supplier cost higher than retail is nonsensical.
+# MONGODB PRICE CACHE — rrp_gbp and supplier cost consistency
+# rrp_gbp = our retail price from MongoDB catalog
+# unit_cost_gbp = always 35-65% of rrp_gbp (never higher than retail)
 # ─────────────────────────────────────────────────────────────
 
 _mongo_prices: dict = {}
@@ -60,7 +57,7 @@ def load_mongo_prices() -> dict:
         client.close()
         log.info(f"Loaded {len(_mongo_prices)} product prices from MongoDB")
     except Exception as e:
-        log.warning(f"MongoDB unavailable ({e}) — supplier cost will use random fallback")
+        log.warning(f"MongoDB unavailable ({e}) — prices will use random fallback")
         _mongo_prices = {}
     return _mongo_prices
 
@@ -100,38 +97,46 @@ def dirty_quantity(qty, dirty):
         return random.choice(["","many","-1","N/A"])
     return str(qty)
 
-# Each supplier has different column names — intentional messiness for Silver
+# Each supplier uses different column names — intentional messiness for Silver
+# All now include RRP and Lead Days columns
 SCHEMA_VARIANTS = {
-    "SUP001": ["SKU", "Product Name", "Unit Cost GBP", "Stock QTY", "Lead Days", "EAN"],
-    "SUP002": ["sku_code", "description", "cost_price", "available_qty", "delivery_days", "barcode"],
-    "SUP003": ["Item Code", "Item Description", "Price (GBP)", "Qty Available", "Lead Time", "EAN Code"],
-    "SUP004": ["PART_NO", "PART_DESC", "UNIT_PRICE", "QTY_OH", "LEAD_TIME", "BARCODE"],
-    "SUP005": ["product_id", "product_name", "wholesale_price", "stock_level", "days_to_ship", "ean"],
+    "SUP001": ["SKU", "Product Name", "Unit Cost GBP", "RRP GBP", "Stock QTY", "Lead Days", "EAN"],
+    "SUP002": ["sku_code", "description", "cost_price", "rrp_price", "available_qty", "delivery_days", "barcode"],
+    "SUP003": ["Item Code", "Item Description", "Price (GBP)", "RRP (GBP)", "Qty Available", "Lead Time", "EAN Code"],
+    "SUP004": ["PART_NO", "PART_DESC", "UNIT_PRICE", "RRP", "QTY_OH", "LEAD_TIME", "BARCODE"],
+    "SUP005": ["product_id", "product_name", "wholesale_price", "retail_price", "stock_level", "days_to_ship", "ean"],
 }
 
 def generate_supplier_csv(supplier, drop_date, dirty=False):
-    ids     = get_entity_ids()
-    skus    = random.sample(ids["product_skus"], min(len(ids["product_skus"]), random.randint(30,80)))
-    headers = SCHEMA_VARIANTS.get(supplier["id"], SCHEMA_VARIANTS["SUP001"])
-    rows    = [headers]
+    ids      = get_entity_ids()
+    mongo_p  = load_mongo_prices()
+    skus     = random.sample(ids["product_skus"], min(len(ids["product_skus"]), random.randint(30,80)))
+    headers  = SCHEMA_VARIANTS.get(supplier["id"], SCHEMA_VARIANTS["SUP001"])
+    rows     = [headers]
 
     for sku in skus:
-        retail_price = load_mongo_prices().get(sku, random.randint(499, 29999))
-        cost_price   = int(retail_price * random.uniform(0.35, 0.65))
-        stock_qty  = random.randint(0, 500)
-        lead_days  = random.randint(1, 14)
-        ean        = str(random.randint(1000000000000, 9999999999999))
-        row        = [
+        # rrp from MongoDB catalog — never null, never random
+        rrp_pence    = mongo_p.get(sku, random.randint(499, 29999))
+        # cost is always 35-65% of retail — supplier cost < retail is mandatory
+        cost_pence   = int(rrp_pence * random.uniform(0.35, 0.65))
+        stock_qty    = random.randint(0, 500)
+        # lead_days: realistic supplier lead times 3-21 days
+        lead_days    = random.randint(3, 21)
+        ean          = str(random.randint(1000000000000, 9999999999999))
+
+        row = [
             dirty_sku(sku, dirty),
             maybe_null(fake.catch_phrase(), dirty),
-            dirty_price(f"{cost_price/100:.2f}", dirty),
+            dirty_price(f"{cost_pence/100:.2f}", dirty),      # Unit Cost GBP
+            dirty_price(f"{rrp_pence/100:.2f}", dirty),       # RRP GBP — from MongoDB
             dirty_quantity(stock_qty, dirty),
-            maybe_null(str(lead_days), dirty),
+            maybe_null(str(lead_days), dirty),                # Lead Days — never always-null
             maybe_null(ean, dirty),
         ]
+
         # Dirty: 2% truncated rows
         if dirty and random.random() < 0.02:
-            row = row[:random.randint(1,4)]
+            row = row[:random.randint(1,5)]
         # Dirty: 1% blank rows
         if dirty and random.random() < 0.01:
             row = [""] * len(headers)
@@ -150,15 +155,17 @@ def generate_supplier_csv(supplier, drop_date, dirty=False):
 def generate_supplier_excel(supplier, drop_date, dirty=False):
     try:
         import openpyxl
-        ids = get_entity_ids()
-        wb  = openpyxl.Workbook()
-        ws  = wb.active; ws.title = "Product Catalog"
-        ws.append(["Product Code","Description","RRP GBP","Cost Price GBP","Stock","Warehouse","Updated Date"])
+        ids     = get_entity_ids()
+        mongo_p = load_mongo_prices()
+        wb      = openpyxl.Workbook()
+        ws      = wb.active; ws.title = "Product Catalog"
+        ws.append(["Product Code","Description","RRP GBP","Cost Price GBP","Stock","Warehouse","Lead Days","Updated Date"])
         skus = random.sample(ids["product_skus"], min(len(ids["product_skus"]), random.randint(20,60)))
         for sku in skus:
-            rrp   = load_mongo_prices().get(sku, random.randint(499, 29999))
-            cost  = int(rrp * random.uniform(0.35, 0.65))
-            stock = random.randint(0, 300)
+            rrp       = mongo_p.get(sku, random.randint(499, 29999))
+            cost      = int(rrp * random.uniform(0.35, 0.65))
+            stock     = random.randint(0, 300)
+            lead_days = random.randint(3, 21)
             ws.append([
                 dirty_sku(sku, dirty),
                 maybe_null(fake.catch_phrase(), dirty),
@@ -166,6 +173,7 @@ def generate_supplier_excel(supplier, drop_date, dirty=False):
                 dirty_price(f"{cost/100:.2f}", dirty),
                 dirty_quantity(stock, dirty),
                 random.choice(WAREHOUSES),
+                maybe_null(str(lead_days), dirty),
                 drop_date.strftime("%Y-%m-%d"),
             ])
         buf = io.BytesIO(); wb.save(buf); buf.seek(0)
@@ -179,11 +187,6 @@ def generate_file(supplier, drop_date, dirty=False):
     return generate_supplier_excel(supplier, drop_date, dirty) if supplier["format"] == "excel" \
            else generate_supplier_csv(supplier, drop_date, dirty)
 
-def quarantine(output_dir, reason, data):
-    qd = output_dir / "quarantine"; qd.mkdir(parents=True, exist_ok=True)
-    with open(qd / f"q_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json","w") as f:
-        json.dump({"reason": reason, "data": data, "ts": datetime.now(timezone.utc).isoformat()}, f, default=str)
-
 def run_burst(output_dir, days=7, dirty=False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}"); get_entity_ids(); load_mongo_prices()
     t0, stats, now = time.time(), {"files":0}, datetime.now(timezone.utc)
@@ -195,7 +198,7 @@ def run_burst(output_dir, days=7, dirty=False):
             filename, content = generate_file(supplier, file_date, dirty)
             date_path = output_dir / file_date.strftime("%Y/%m/%d"); date_path.mkdir(parents=True, exist_ok=True)
             filepath = date_path / filename
-            if filepath.exists():  # Rule 5: idempotent — skip if already written
+            if filepath.exists():  # Rule 5: idempotent
                 log.info(f"  Skipped (exists): {filename}")
                 continue
             with open(filepath, "wb") as f: f.write(content)

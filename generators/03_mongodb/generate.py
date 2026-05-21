@@ -8,33 +8,13 @@ product_sku matches what order_items in Postgres references.
 This is the cross-system foreign key — Postgres holds the order reference,
 MongoDB holds the product detail.
 
-Rules satisfied:
-    Rule 1  — --mode burst and --mode stream
-    Rule 2  — burst < 2 minutes (200 products = fast)
-    Rule 3  — product created_at spread across burst period
-    Rule 4  — product status reflects age and inventory level
-    Rule 5  — upsert by _id (idempotent — safe to run twice)
-    Rule 6  — stream: ~1 product update per 9s (~10K/day)
-    Rule 7  — dirty: missing fields, wrong types, truncated descriptions
-    Rule 8  — README.md exists
-    Rule 9  — env vars: MONGO_URI
-    Rule 10 — callable from single bash line
-    Rule 11 — product_sku matches Postgres order_items (same SKU-XXXXX format)
-
-Usage:
-    python generate.py --mode burst --days 7
-    python generate.py --mode burst --days 7 --dirty
-    python generate.py --mode stream
+Rules satisfied: All 11.
+Fix applied: base_price_pence NEVER null — master catalog price is mandatory.
+             changed_at ALWAYS populated — every product has price history.
 """
 
-import os
-import sys
-import time
-import random
-import logging
-import argparse
+import os, sys, time, random, logging, argparse, hashlib
 from datetime import datetime, timezone, timedelta
-
 from faker import Faker
 from dotenv import load_dotenv
 
@@ -51,22 +31,16 @@ try:
     from pymongo import MongoClient, UpdateOne
     from pymongo.errors import BulkWriteError
 except ImportError:
-    log.error("pymongo not installed: pip install pymongo")
-    sys.exit(1)
+    log.error("pymongo not installed: pip install pymongo"); import sys; sys.exit(1)
 
-import hashlib
+fake = Faker("en_GB"); Faker.seed(42)
 
-fake = Faker("en_GB")
-Faker.seed(42)
-
-STREAM_SLEEP = 86400 / 10000  # Rule 6 + Rule 13: ~10K updates/day
+STREAM_SLEEP = 86400 / 10000
 MONGO_URI    = os.environ.get("MONGO_URI", "mongodb+srv://mongo_admin:MongoAdmin2026!@ecommerce-cluster.k2gc71w.mongodb.net/")
 DB_NAME      = os.environ.get("MONGO_DBNAME", "ecommerce")
 COLLECTION   = "products"
 HISTORY_COL  = "product_price_history"
 
-# Rule 11: loaded from Postgres at startup — not hardcoded
-# Fallback list used only if Postgres is unreachable
 _FALLBACK_SKUS = [f"SKU-{str(i).zfill(5)}" for i in range(1, 201)]
 _entity_ids    = None
 
@@ -75,9 +49,9 @@ def get_product_skus() -> list:
     if _entity_ids is None:
         try:
             _entity_ids = load_entity_ids()
-            log.info(f"Rule 11 ✅ loaded {len(_entity_ids['product_skus'])} SKUs from Postgres")
+            log.info(f"Rule 11 loaded {len(_entity_ids['product_skus'])} SKUs from Postgres")
         except Exception as e:
-            log.warning(f"Rule 11 ⚠️ Postgres unavailable ({e}) — using fallback SKU list")
+            log.warning(f"Postgres unavailable ({e}) — using fallback SKU list")
             _entity_ids = {"product_skus": _FALLBACK_SKUS}
     return _entity_ids["product_skus"]
 
@@ -111,34 +85,23 @@ CATEGORIES = {
     },
 }
 
-
-# ─────────────────────────────────────────────────────────────
-# RULE 4 — PRODUCT STATUS REFLECTS AGE AND STOCK
-# ─────────────────────────────────────────────────────────────
-
 def product_status(created_at: datetime, stock: int) -> str:
     age_days = (datetime.now(timezone.utc) - created_at).days
-    if stock == 0:
-        return "out_of_stock"
-    elif stock < 10:
-        return "low_stock"
-    elif age_days < 14:
-        return "new"
-    elif age_days > 365 and random.random() < 0.05:
-        return "discontinued"
-    else:
-        return "active"
-
-
-# ─────────────────────────────────────────────────────────────
-# RULE 7 — DIRTY DATA
-# ─────────────────────────────────────────────────────────────
+    if stock == 0:           return "out_of_stock"
+    elif stock < 10:         return "low_stock"
+    elif age_days < 14:      return "new"
+    elif age_days > 365 and random.random() < 0.05: return "discontinued"
+    else:                    return "active"
 
 def dr(base, dirty, elevated): return elevated if dirty else base
 def maybe_null(v, dirty, base=0.05, elev=0.20):
     return None if random.random() < dr(base, dirty, elev) else v
 
-def dirty_price(price_pence, dirty):
+def dirty_price_display(price_pence, dirty):
+    """
+    Only used for VARIANT prices — never for base_price_pence.
+    Variant prices can be dirty; the canonical catalog price must not be.
+    """
     if random.random() < dr(0.005, dirty, 0.08):
         return random.choice(["POA", None, -1, 0, "free"])
     return price_pence
@@ -148,28 +111,25 @@ def dirty_sku(sku, dirty):
         return random.choice(["", None, sku.lower(), "UNKNOWN"])
     return sku
 
-
-# ─────────────────────────────────────────────────────────────
-# PRODUCT BUILDER
-# ─────────────────────────────────────────────────────────────
-
 def build_product(sku: str, created_at: datetime, dirty: bool = False) -> dict:
     category_name = random.choice(list(CATEGORIES.keys()))
     category      = CATEGORIES[category_name]
     subcategory   = random.choice(category["subcategories"])
     brand         = random.choice(category["brands"])
+
+    # base_price_pence is ALWAYS a valid integer — master catalog price is mandatory.
+    # Dirty mode corrupts other fields (description, variants, attributes) but never this.
     price_pence   = random.randint(499, 29999)
     cost_pence    = int(price_pence * random.uniform(0.4, 0.65))
     stock         = random.randint(0, 500)
 
-    # Variants — e.g. colour variants of the same product
     variants = []
     for colour in random.sample(["Black", "White", "Silver", "Blue", "Red"], k=random.randint(1, 3)):
         v_price = int(price_pence * random.uniform(0.9, 1.1))
         variants.append({
             "colour":       colour,
             "sku_variant":  f"{sku}-{colour[:3].upper()}",
-            "price_pence":  dirty_price(v_price, dirty),
+            "price_pence":  dirty_price_display(v_price, dirty),  # variants can be dirty
             "stock":        maybe_null(random.randint(0, 200), dirty),
             "weight_grams": maybe_null(random.randint(100, 5000), dirty),
         })
@@ -178,14 +138,15 @@ def build_product(sku: str, created_at: datetime, dirty: bool = False) -> dict:
 
     product = {
         "_id":              dirty_sku(sku, dirty),
-        "product_sku":      sku,  # Always clean — needed for joins
+        "product_sku":      sku,
         "name":             maybe_null(fake.catch_phrase(), dirty),
         "category":         category_name,
         "subcategory":      maybe_null(subcategory, dirty),
         "brand":            maybe_null(brand, dirty),
-        "description":      maybe_null(
-            " ".join(fake.sentences(nb=random.randint(2, 4))), dirty),
-        "base_price_pence": dirty_price(price_pence, dirty),
+        "description":      maybe_null(" ".join(fake.sentences(nb=random.randint(2, 4))), dirty),
+        # base_price_pence: ALWAYS int — never wrapped with dirty_price
+        # This is the join key for Shopify, SFTP, Scrapy, Clickstream price consistency
+        "base_price_pence": price_pence,
         "cost_price_pence": maybe_null(cost_pence, dirty),
         "variants":         variants,
         "attributes":       maybe_null(category["attributes"](), dirty),
@@ -193,8 +154,7 @@ def build_product(sku: str, created_at: datetime, dirty: bool = False) -> dict:
             f"https://cdn.ecommerce.example.com/products/{sku}/main.jpg",
             f"https://cdn.ecommerce.example.com/products/{sku}/alt1.jpg",
         ] if not dirty or random.random() > 0.05 else [],
-        "tags":             random.sample(
-            ["sale", "new", "bestseller", "clearance", "exclusive", "bundle"], k=2),
+        "tags":             random.sample(["sale","new","bestseller","clearance","exclusive","bundle"], k=2),
         "status":           status,
         "rating":           maybe_null(round(random.uniform(3.0, 5.0), 1), dirty),
         "review_count":     maybe_null(random.randint(0, 500), dirty),
@@ -202,35 +162,28 @@ def build_product(sku: str, created_at: datetime, dirty: bool = False) -> dict:
         "updated_at":       created_at.isoformat(),
     }
 
-    # Dirty: 1% truncated description (simulate partial write)
+    # Dirty: corrupt other fields — never base_price_pence
     if dirty and random.random() < 0.01 and product.get("description"):
-        desc = product["description"]
-        product["description"] = desc[:random.randint(10, 30)]
-
-    # Dirty: 0.5% wrong type for price
+        product["description"] = product["description"][:random.randint(10, 30)]
     if dirty and random.random() < 0.005:
-        product["base_price_pence"] = str(price_pence)  # String instead of int
+        product["name"] = None  # corrupt name, not price
 
-    return product
+    return product, price_pence  # always return the canonical price separately
 
 
-def build_price_history(sku: str, created_at: datetime, current_price: int) -> dict:
-    # Rule 12: deterministic _id — safe to run burst twice without duplicating history
+def build_price_history(sku: str, created_at: datetime, price_pence: int) -> dict:
+    # Deterministic _id — safe to run burst twice without duplicating history
     history_id = hashlib.md5(
-        f"{sku}:{created_at.strftime('%Y-%m-%d')}:{current_price}".encode()
+        f"{sku}:{created_at.strftime('%Y-%m-%d')}:{price_pence}".encode()
     ).hexdigest()
     return {
         "_id":         history_id,
         "product_sku": sku,
-        "price_pence": current_price,
-        "changed_at":  created_at.isoformat(),
+        "price_pence": price_pence,           # always int — canonical price
+        "changed_at":  created_at.isoformat(), # always populated
         "reason":      random.choice(["promotion", "restock", "market_adjustment"]),
     }
 
-
-# ─────────────────────────────────────────────────────────────
-# BURST MODE
-# ─────────────────────────────────────────────────────────────
 
 def run_burst(days: int = 7, dirty: bool = False):
     log.info(f"BURST MODE | days={days} | dirty={dirty}")
@@ -244,27 +197,27 @@ def run_burst(days: int = 7, dirty: bool = False):
     now          = datetime.now(timezone.utc)
     ops          = []
     history_ops  = []
-    product_skus = get_product_skus()  # Rule 11: real SKUs from Postgres
+    product_skus = get_product_skus()
 
     for sku in product_skus:
         days_ago   = random.uniform(0, days)
         created_at = now - timedelta(days=days_ago)
-        product    = build_product(sku, created_at, dirty)
+
+        # build_product now returns (product_dict, canonical_price)
+        # canonical_price is always int — used for history regardless of dirty state
+        product, canonical_price = build_product(sku, created_at, dirty)
 
         # Rule 5: upsert by _id — safe to run twice
         ops.append(UpdateOne({"_id": sku}, {"$set": product}, upsert=True))
 
-        # Rule 12: upsert history by deterministic _id — safe to run twice
-        if isinstance(product.get("base_price_pence"), int):
-            h = build_price_history(sku, created_at, product["base_price_pence"])
-            history_ops.append(
-                UpdateOne({"_id": h["_id"]}, {"$setOnInsert": h}, upsert=True)
-            )
-            stats["history"] += 1
-
+        # Price history always created — canonical_price is always int
+        h = build_price_history(sku, created_at, canonical_price)
+        history_ops.append(
+            UpdateOne({"_id": h["_id"]}, {"$setOnInsert": h}, upsert=True)
+        )
+        stats["history"] += 1
         stats["upserted"] += 1
 
-    # Bulk write
     if ops:
         try:
             result = col.bulk_write(ops, ordered=False)
@@ -274,7 +227,7 @@ def run_burst(days: int = 7, dirty: bool = False):
 
     if history_ops:
         try:
-            hcol.bulk_write(history_ops, ordered=False)  # Rule 12: upsert not insert
+            hcol.bulk_write(history_ops, ordered=False)
         except BulkWriteError as e:
             log.error(f"History bulk write error: {e.details}")
 
@@ -283,10 +236,6 @@ def run_burst(days: int = 7, dirty: bool = False):
     log.info(f"✓ BURST COMPLETE | {elapsed:.1f}s | {stats}")
     log.info(f"Rule 2 {'✅' if elapsed <= 120 else 'VIOLATION'} {elapsed:.1f}s")
 
-
-# ─────────────────────────────────────────────────────────────
-# STREAM MODE — simulate ongoing catalog changes
-# ─────────────────────────────────────────────────────────────
 
 def run_stream(dirty: bool = False):
     log.info(f"STREAM MODE | ~10K/day | dirty={dirty} | Ctrl+C to stop")
@@ -302,38 +251,27 @@ def run_stream(dirty: bool = False):
             i   += 1
             sku  = random.choice(get_product_skus())
             now  = datetime.now(timezone.utc)
-
-            # Simulate: price change, stock update, or status change
             change_type = random.choice(["price", "stock", "status"])
 
             if change_type == "price":
                 new_price = random.randint(499, 29999)
                 col.update_one(
                     {"_id": sku},
-                    {"$set": {
-                        "base_price_pence": new_price,
-                        "updated_at": now.isoformat()
-                    }},
+                    {"$set": {"base_price_pence": new_price, "updated_at": now.isoformat()}},
                     upsert=True
                 )
                 hcol.insert_one(build_price_history(sku, now, new_price))
-
             elif change_type == "stock":
                 col.update_one(
                     {"_id": sku},
-                    {"$set": {
-                        "updated_at": now.isoformat()
-                    },
+                    {"$set": {"updated_at": now.isoformat()},
                      "$inc": {"variants.0.stock": random.randint(-5, 50)}},
                     upsert=True
                 )
             else:
                 col.update_one(
                     {"_id": sku},
-                    {"$set": {
-                        "status":     random.choice(["active", "low_stock"]),
-                        "updated_at": now.isoformat(),
-                    }},
+                    {"$set": {"status": random.choice(["active","low_stock"]), "updated_at": now.isoformat()}},
                     upsert=True
                 )
 
@@ -347,10 +285,6 @@ def run_stream(dirty: bool = False):
         log.info(f"Stopped. {stats}")
 
 
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────
-
 def main():
     p = argparse.ArgumentParser(description="Source 03 — MongoDB Product Catalog")
     p.add_argument("--mode",  choices=["burst","stream"], required=True)
@@ -358,7 +292,7 @@ def main():
     p.add_argument("--dirty", action="store_true")
     args = p.parse_args()
     log.info(f"Source 03 | mode={args.mode} | days={args.days} | dirty={args.dirty}")
-    if args.mode == "burst":   run_burst(args.days, args.dirty)
+    if args.mode == "burst":    run_burst(args.days, args.dirty)
     elif args.mode == "stream": run_stream(args.dirty)
 
 if __name__ == "__main__":
