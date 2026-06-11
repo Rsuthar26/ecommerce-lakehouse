@@ -162,9 +162,12 @@ def dirty_amount(amount, dirty):
     return amount
 
 def dirty_status(status, valid_statuses, dirty):
-    if random.random() < dr(0.01, dirty, 0.15):
-        return random.choice([status.upper(), status.capitalize(), "UNKNOWN"])
-    return status
+    # Check constraints require lowercase — never return uppercase or capitalised.
+    # Dirty mode returns an invalid enum string that Silver must catch,
+    # but it must still be a string (not break the INSERT with a case violation).
+    if dirty and random.random() < dr(0.01, dirty, 0.15):
+        return "unknown_status"   # invalid enum — Silver quarantines it
+    return status                 # always lowercase — matches check constraint
 
 
 # ─────────────────────────────────────────────────────────────
