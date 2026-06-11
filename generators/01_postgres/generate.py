@@ -221,7 +221,7 @@ def seed_products_and_inventory(cur, count: int = 200, dirty: bool = False):
         """, (
             sku,
             random.choice(WAREHOUSES),
-            dirty_amount(random.randint(0, 500), dirty),
+            max(0, dirty_amount(random.randint(0, 500), dirty)),  # check constraint: quantity_available >= 0
             random.randint(0, 20),
             int(price_pence * 0.55),
         ))
