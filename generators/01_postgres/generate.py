@@ -247,7 +247,7 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
              discount_amount_pence, shipping_amount_pence, currency,
              shipping_address, shipping_city, shipping_postcode,
              shipping_country, created_at, updated_at)
-        VALUES (%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING order_id
     """, (
         customer_id,
@@ -333,7 +333,7 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
     """, (
         order_id,
         f"pi_{hashlib.md5(f'order_{order_id}_{created_at.date()}'.encode()).hexdigest()[:24]}",
-        total_pence,
+        total_amount_pence,
         "GBP",
         dirty_status(payment_status, ["pending","succeeded","failed","refunded"], dirty),
         random.choice(PAYMENT_METHODS),
