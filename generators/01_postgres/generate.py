@@ -320,10 +320,11 @@ def generate_order(cur, created_at: datetime, dirty: bool = False):
     cur.execute("""
         UPDATE orders
         SET total_amount_pence    = %s,
+            subtotal_pence        = %s,
             discount_amount_pence = %s,
             shipping_amount_pence = %s
         WHERE order_id = %s
-    """, (total_amount_pence, discount_pence, shipping_pence, order_id))
+    """, (total_amount_pence, subtotal_pence, discount_pence, shipping_pence, order_id))
 
     # Payment
     payment_status = payment_status_for_order_status(order_status)
