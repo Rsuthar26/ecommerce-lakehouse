@@ -144,8 +144,16 @@ def maybe_null(value, dirty, base=0.05, elev=0.20):
     return None if random.random() < dr(base, dirty, elev) else value
 
 def dirty_email(email, dirty):
-    if random.random() < dr(0.01, dirty, 0.08):
-        return random.choice(["invalid-email", "@nodomain", "", None, "user@"])
+    # Email is NOT NULL in Postgres — never return None or empty string.
+    # Dirty mode produces malformed but non-null emails (bad format, not missing).
+    if dirty and random.random() < dr(0.01, dirty, 0.08):
+        return random.choice([
+            "invalid-email",
+            "@nodomain.com",
+            "user@",
+            f"{email}..",
+            email.replace("@", ""),
+        ])
     return email
 
 def dirty_amount(amount, dirty):
@@ -164,7 +172,7 @@ def dirty_status(status, valid_statuses, dirty):
 # ─────────────────────────────────────────────────────────────
 
 def create_schema(cur):
-    with open(os.path.join(os.path.dirname(__file__), "schema.sql"), "r") as f:
+    with open(os.path.join(os.path.dirname(__file__), "sql", "schema.sql"), "r") as f:
         cur.execute(f.read())
 
 
