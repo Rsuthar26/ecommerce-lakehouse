@@ -142,10 +142,11 @@ def get_producer():
         bootstrap_servers=BROKERS.split(","),
         security_protocol="SASL_SSL", sasl_mechanism="SCRAM-SHA-512",
         sasl_plain_username=os.environ.get("KAFKA_USERNAME", "kafka-admin"),
-        sasl_plain_password=os.environ.get("KAFKA_PASSWORD", ""),
+        sasl_plain_password=os.environ.get("KAFKA_PASSWORD", "KafkaAdmin2026!"),
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
-        acks=1, retries=3, batch_size=32768, linger_ms=50, compression_type="gzip",
+        acks="all", retries=3, batch_size=16384, linger_ms=10,
+        compression_type="gzip",
     )
 
 def run_burst(days=7, dirty=False):
