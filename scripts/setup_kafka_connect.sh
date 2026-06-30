@@ -16,11 +16,17 @@ yum install -y java-17-amazon-corretto-headless git python3-pip
 # ── 2. Python deps ────────────────────────────────────────────
 pip3 install kafka-python boto3 psycopg2-binary pymongo requests faker python-dotenv
 
-# ── 3. Clone repo ─────────────────────────────────────────────
+# ── 3. Clone repo (idempotent — handles re-runs / leftover state) ────
 cd /home/ec2-user
-git clone https://github.com/Rsuthar26/ecommerce-lakehouse.git
-chown -R ec2-user:ec2-user ecommerce-lakehouse
-cd ecommerce-lakehouse
+if [ -d "ecommerce-lakehouse" ]; then
+  echo "ecommerce-lakehouse directory already exists — pulling latest instead of cloning"
+  cd ecommerce-lakehouse
+  git pull origin main
+else
+  git clone https://github.com/Rsuthar26/ecommerce-lakehouse.git
+  cd ecommerce-lakehouse
+fi
+chown -R ec2-user:ec2-user /home/ec2-user/ecommerce-lakehouse
 
 # ── 4. Confluent 7.6.0 ───────────────────────────────────────
 curl -O https://packages.confluent.io/archive/7.6/confluent-community-7.6.0.tar.gz

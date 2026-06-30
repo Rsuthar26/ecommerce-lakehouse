@@ -76,22 +76,34 @@ resource "aws_instance" "debezium" {
     volume_type = "gp3"
   }
 
+  # user_data_replace_on_change forces EC2 to re-run user_data whenever this
+  # script changes — without it, terraform apply silently keeps old user_data
+  # cached on existing instances, masking bugs during iteration.
+  user_data_replace_on_change = true
+
   user_data = <<-EOF
-#!/bin/bash
-set -e
-exec > /var/log/user-data.log 2>&1
+    #!/bin/bash
+    set -e
+    # Explicit marker BEFORE redirect — proves cloud-init actually invoked
+    # this script at all. If this file is missing after boot, cloud-init
+    # never executed user_data — check console output / IMDS user-data directly.
+    touch /var/log/user-data-started.marker
+    exec > /var/log/user-data.log 2>&1
+    echo "=== user_data starting at $(date) ==="
 
-# Download and run setup script from repo
-curl -fsSL https://raw.githubusercontent.com/Rsuthar26/ecommerce-lakehouse/main/scripts/setup_kafka_connect.sh \
-  -o /tmp/setup_kafka_connect.sh
-chmod +x /tmp/setup_kafka_connect.sh
-# Retry up to 3 times — handles transient GitHub/Confluent Hub failures
-for i in 1 2 3; do
-  bash /tmp/setup_kafka_connect.sh ${aws_msk_cluster.main.arn} && break
-  echo "Attempt $i failed, retrying in 30s..."
-  sleep 30
-done
+    # Download and run setup script from repo
+    curl -fsSL https://raw.githubusercontent.com/Rsuthar26/ecommerce-lakehouse/main/scripts/setup_kafka_connect.sh \
+      -o /tmp/setup_kafka_connect.sh
+    chmod +x /tmp/setup_kafka_connect.sh
+    # Retry up to 3 times — handles transient GitHub/Confluent Hub failures
+    for i in 1 2 3; do
+      bash /tmp/setup_kafka_connect.sh ${aws_msk_cluster.main.arn} && break
+      echo "Attempt $i failed, retrying in 30s..."
+      sleep 30
+    done
 
+    echo "=== user_data finished at $(date) ==="
+    touch /var/log/user-data-complete.marker
   EOF
 
   tags = { Name = "${var.project_name}-debezium" }
