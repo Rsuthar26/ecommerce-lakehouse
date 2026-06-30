@@ -38,11 +38,9 @@ fake = Faker("en_GB"); Faker.seed(42)
 
 STREAM_SLEEP = 86400 / 50000   # Rule 6 + Rule 13
 TOPIC        = "app.logs"
-BROKERS      = os.environ.get(
-    "KAFKA_BOOTSTRAP_SERVERS",
-    "b-1.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094,"
-    "b-2.staffdejourneykafka.g6712a.c2.kafka.eu-north-1.amazonaws.com:9094"
-)
+# Never hardcode brokers — MSK address changes on every recreation.
+# KAFKA_BROKERS is resolved dynamically at EC2 boot via aws kafka get-bootstrap-brokers.
+BROKERS      = os.environ.get("KAFKA_BROKERS", os.environ.get("KAFKA_BOOTSTRAP_SERVERS", ""))
 
 LOG_LEVELS  = ["INFO","INFO","INFO","INFO","WARN","ERROR","DEBUG"]
 LOG_SOURCES = ["api-gateway","order-service","payment-service",
@@ -133,8 +131,18 @@ def build_log_event(event_dt: datetime, dirty: bool = False,
     return event
 
 def get_producer():
+    if not BROKERS:
+        raise RuntimeError(
+            "KAFKA_BROKERS not set. Export it before running: "
+            "export KAFKA_BROKERS=$(aws kafka get-bootstrap-brokers "
+            "--cluster-arn $MSK_CLUSTER_ARN --region eu-west-1 "
+            "--query 'BootstrapBrokerStringSaslScram' --output text)"
+        )
     return KafkaProducer(
-        bootstrap_servers=BROKERS.split(","), security_protocol="SSL",
+        bootstrap_servers=BROKERS.split(","),
+        security_protocol="SASL_SSL", sasl_mechanism="SCRAM-SHA-512",
+        sasl_plain_username=os.environ.get("KAFKA_USERNAME", "kafka-admin"),
+        sasl_plain_password=os.environ.get("KAFKA_PASSWORD", ""),
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
         acks=1, retries=3, batch_size=32768, linger_ms=50, compression_type="gzip",
