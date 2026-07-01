@@ -197,8 +197,8 @@ def extract_collection(db, collection_name: str, incremental_col: str,
         df["_id"] = df["_id"].astype(str)
 
     # Calculate watermark and data date range
-    high_ts    = df[incremental_col].max()
-    low_ts     = df[incremental_col].min()
+    high_ts    = pd.to_datetime(df[incremental_col], utc=True, errors="coerce").max()
+    low_ts     = pd.to_datetime(df[incremental_col], utc=True, errors="coerce").min()
 
     high_wm    = high_ts.isoformat() if hasattr(high_ts, "isoformat") else str(high_ts)
     data_start = low_ts.strftime("%Y%m%d")  if hasattr(low_ts,  "strftime") else str(low_ts)[:10].replace("-","")
@@ -225,6 +225,16 @@ def build_s3_key(collection_name: str, run_ts: datetime,
 
 
 def df_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    # Normalize any mixed-type datetime columns to consistent timestamps
+    for col in df.columns:
+        if df[col].dtype == object:
+            sample = df[col].dropna().head(10)
+            if sample.apply(lambda x: isinstance(x, datetime)).any():
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    # Final fallback: cast any remaining object columns to string to avoid pyarrow type errors
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].astype(str)
     buffer = io.BytesIO()
     df.to_parquet(buffer, index=False, compression="snappy", engine="pyarrow")
     buffer.seek(0)
