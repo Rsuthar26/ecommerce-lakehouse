@@ -189,7 +189,7 @@ def main():
         description="Source 12 Reviews/Tickets → S3 Raw ingestion"
     )
     parser.add_argument("--input-dir", type=str,
-                        default=os.environ.get("REVIEWS_OUTPUT_DIR", "/tmp/reviews_raw"))
+                        default=os.environ.get("REVIEWS_OUTPUT_DIR", "/tmp/reviews_tickets_raw"))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

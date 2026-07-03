@@ -188,7 +188,7 @@ def main():
         description="Source 18 SES Email → S3 Raw ingestion"
     )
     parser.add_argument("--input-dir", type=str,
-                        default=os.environ.get("SES_OUTPUT_DIR", "/tmp/ses_raw"))
+                        default=os.environ.get("SES_OUTPUT_DIR", "/tmp/email_raw"))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

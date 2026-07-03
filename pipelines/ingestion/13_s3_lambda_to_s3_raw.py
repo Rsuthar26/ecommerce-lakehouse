@@ -191,7 +191,7 @@ def main():
         description="Source 13 S3 Lambda → S3 Raw ingestion"
     )
     parser.add_argument("--input-dir", type=str,
-                        default=os.environ.get("LAMBDA_OUTPUT_DIR", "/tmp/lambda_raw"))
+                        default=os.environ.get("LAMBDA_OUTPUT_DIR", "/tmp/image_metadata_raw"))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
