@@ -239,7 +239,7 @@ def main():
     p.add_argument("--mode", choices=["burst","stream"], required=True)
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--dirty", action="store_true")
-    p.add_argument("--output-dir", type=str, default=os.environ.get("REVIEWS_OUTPUT_DIR","/tmp/text_raw"))
+    p.add_argument("--output-dir", type=str, default=os.environ.get("REVIEWS_OUTPUT_DIR","/tmp/reviews_tickets_raw"))
     args = p.parse_args()
     od = Path(args.output_dir); od.mkdir(parents=True, exist_ok=True)
     if args.mode == "burst": run_burst(od, args.days, args.dirty)

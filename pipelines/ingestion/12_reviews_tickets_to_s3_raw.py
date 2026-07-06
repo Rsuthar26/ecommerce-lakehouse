@@ -193,7 +193,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir)
+    input_dir = Path(args.input_dir).resolve()
     if not input_dir.exists():
         import sys
         log.error(f"Input directory does not exist: {input_dir}")
