@@ -129,10 +129,14 @@ def run(input_dir: Path, dry_run: bool = False):
 
     already_uploaded = set() if dry_run else load_manifest(s3_client)
 
+    import os as _os
     all_files = [
-        p for p in input_dir.rglob("*.json")
-        if "quarantine" not in str(p)
-        and "_metadata"  not in str(p)
+        Path(root) / fname
+        for root, dirs, files in _os.walk(str(input_dir))
+        for fname in files
+        if fname.endswith(".json")
+        and "quarantine" not in root
+        and "/_metadata/" not in root
     ]
 
     log.info(f"Found {len(all_files)} local JSON files")
